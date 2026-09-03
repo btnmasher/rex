@@ -183,6 +183,19 @@ tasks:
       - task: vet
       - task: lint
 
+  ci:checks:
+    desc: Run CI quality gates and reject generated or formatted drift.
+    cmds:
+      - task: verify
+      - task: test:race
+      - git diff --exit-code
+
+  ci:
+    desc: Run all CI checks and build the Docker image.
+    cmds:
+      - task: ci:checks
+      - task: docker:build
+
   docker:build:
     desc: Build the standalone service image from the repository root.
     cmds:

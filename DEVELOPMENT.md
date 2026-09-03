@@ -222,6 +222,7 @@ Run from the repository root:
 task setup
 task generate
 task verify
+task ci:checks
 task test:race
 task build
 task run:debug:race
@@ -229,9 +230,11 @@ task debug:discord
 ```
 
 `task verify` regenerates SQLC clients, checks formatting, runs tests, runs
-`go vet`, and runs `golangci-lint` in both modules. Use `task test:race` for
-concurrency-sensitive changes. The Discord debug command sends synthetic
-events through the configured routing file without connecting to PostgreSQL.
+`go vet`, and runs `golangci-lint` in both modules. `task ci:checks` adds race
+tests and fails if generation or formatting changes the checkout. `task ci`
+also builds the Docker image. Use `task test:race` for concurrency-sensitive
+changes. The Discord debug command sends synthetic events through the
+configured routing file without connecting to PostgreSQL.
 
 For focused jobruntime work:
 
@@ -246,13 +249,21 @@ under `gen/`.
 
 ## Docker And CI
 
-The Dockerfile builds a CGO-free static service image. Migration files are
-embedded in the binary and are not executed during image build. A new image
-applies pending migrations at startup before workers begin.
+The Dockerfile builds a CGO-free static service image as a non-root user.
+Migration files are embedded in the binary and are not executed during image
+build. A new image applies pending migrations at startup before workers begin.
+The Compose configuration mounts `/data` for both SQLite stores, makes the
+container root filesystem read-only, and grants write access only to that
+volume. The destination configuration bind mount uses Docker's private SELinux
+relabel option for Fedora hosts. The image accepts `VERSION`, `REVISION`, and
+`CREATED` build arguments for OCI metadata.
 
-Pull requests and pushes to `main` run verification, race tests, and a Docker
-build without publishing. Version tags matching `v*` publish the image to
-GitHub Container Registry using the workflow's built-in `GITHUB_TOKEN`.
+The CI workflow runs `task ci:checks` and a cached Buildx build for pull
+requests and pushes to `main`. The release workflow accepts Go-style `vX.Y.Z`
+tags, runs the same gates, and publishes the exact tag plus `latest` to GHCR
+using the workflow's built-in `GITHUB_TOKEN`. Release images target amd64 and
+arm64 and include SBOM and provenance attestations. The release workflow is
+the only workflow with `packages: write` permission.
 
 ## Security Checklist
 

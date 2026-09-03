@@ -22,16 +22,16 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.27"
+          cache-dependency-path: |
+            go.sum
+            lib/jobruntime/go.sum
           cache: true
 
       - name: Set up Task
         uses: go-task/setup-task@v1
 
-      - name: Verify
-        run: task verify
-
-      - name: Race tests
-        run: task test:race
+      - name: Quality gates
+        run: task ci:checks
 
   docker:
     name: Docker build

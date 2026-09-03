@@ -29,6 +29,7 @@ This document is an execution policy for coding agents and contributors.
 - Local service: `task run`
 - Build: `task build`
 - Backend checks: `task verify`
+- CI gates: `task ci:checks`
 - Docker image: `task docker:build`
 - Durable job tables only: `task migrate:jobstore`
 
@@ -308,6 +309,10 @@ When the user requests a durable behavior change, record it here or in the relev
   only when `JOB_STORE=postgres`; explicit migration commands select their
   backend by `--store` and require the matching database configuration.
   Auth-next tables remain externally owned and are never migrated by Rex.
+- `task ci:checks` is the canonical pre-merge gate: it runs verification,
+  race tests, and rejects generated or formatted drift. Release tags publish
+  the non-root multi-architecture Docker image to GHCR after those same gates
+  pass.
 - `internal/alerts` may run without a structure database; missing enrichment is
   non-fatal, and ownership-transfer alerts use the informational blue default.
   Full-power structure transitions use the success green default. Both

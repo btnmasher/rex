@@ -1,17 +1,24 @@
 services:
   rex:
-    image: rex-notification-service:local
+    image: ${REX_IMAGE:-rex-notification-service:local}
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VERSION: ${REX_VERSION:-dev}
     env_file:
       - .env
     environment:
+      JOB_STORE_SQLITE_PATH: /data/rex-jobruntime.sqlite
       NOTIFICATION_STATE_SQLITE_PATH: /data/rex-notification-state.sqlite
       ALERT_DESTINATIONS_FILE: /etc/rex/alert-destinations.json
     volumes:
       - rex-state:/data
-      - ./alert-destinations.json:/etc/rex/alert-destinations.json:ro
+      - ./alert-destinations.json:/etc/rex/alert-destinations.json:ro,Z
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 2m
     restart: unless-stopped
 volumes:
   rex-state:

@@ -14,7 +14,8 @@ guidance are documented in [DEVELOPMENT.md](DEVELOPMENT.md).
 ## Quick Start
 
 Requirements: Go 1.27, [Task](https://taskfile.dev/), PostgreSQL access to
-auth-next, and Docker if containerized deployment is desired.
+auth-next, and Docker Engine with the Compose v2 plugin if containerized
+deployment is desired.
 
 ```bash
 cp .env.example .env
@@ -176,9 +177,9 @@ requires `DATABASE_URL`; it does not require `JOB_STORE=postgres`.
 
 The equivalent binary modes are `go run ./cmd/rex --migrate --store sqlite`
 and `go run ./cmd/rex --migrate --store postgres`. Keep SQLite files on
-persistent storage. Docker Compose mounts notification state at `/data`; when
-`JOB_STORE=sqlite`, set `JOB_STORE_SQLITE_PATH=/data/rex-jobruntime.sqlite` in
-`.env` as well.
+persistent storage. Docker Compose mounts both SQLite databases at `/data` and
+sets the job-store path there automatically. For a PostgreSQL job store, set
+`JOB_STORE=postgres` and provide the same `DATABASE_URL` used by auth-next.
 
 Successfully dispatched alerts are retained in `alert_history` for 30 days.
 Each row stores the raw notification, classified event, and exact Discord
@@ -201,6 +202,7 @@ limit 100;
 ```bash
 task setup             # Install/check tools and download dependencies.
 task verify            # Generate clients, test, vet, and lint.
+task ci:checks         # CI gates plus generated-code drift detection.
 task build             # Build the service binary.
 task run               # Run using .env.
 task run:race          # Run with the race detector.
@@ -221,19 +223,39 @@ Use process supervision and structured logs for operational monitoring.
 ## Docker And CI
 
 The image does not run migrations during build. On startup, Rex migrates the
-selected durable stores before starting workers. For local Compose use:
+selected durable stores before starting workers. The image runs as a non-root
+user; Compose additionally makes the root filesystem read-only and persists
+SQLite state in the `rex-state` volume.
+The destination file mount uses Docker's private SELinux relabel option (`Z`),
+which is required on Fedora for the confined container to read a host file.
+
+For local Compose use:
 
 ```bash
 task docker:build
+task docker:up:detach
+```
+
+For a published image, set the image tag and restart the container. The same
+startup migrations run before workers begin, so a new image applies pending
+Rex-owned migrations without a separate migration container:
+
+```bash
+export REX_IMAGE=ghcr.io/btnmasher/rex:1.0.0
+docker compose pull
 docker compose up -d
 ```
 
-For a published image, pull the selected image and restart the container; the
-same startup migrations run before workers begin. The PostgreSQL database must
-already exist and be reachable through `.env`.
-Pull requests and pushes to `main` run verification, race tests, and a Docker
-build. Pushing a `v*` tag publishes the image to
-`ghcr.io/btnmasher/rex`.
+The PostgreSQL database must already exist and be reachable through `.env`.
+Run one Rex instance for a given ESI client identity. Do not use a rolling
+multi-instance deployment because ESI rate-limit state and notification
+coordination are process-local.
+
+Pull requests and pushes to `main` run `task ci:checks` and a cached Docker
+build without publishing. Pushing a Go-style `vX.Y.Z` tag runs the same gates
+and publishes the exact tag plus `latest` to
+`ghcr.io/btnmasher/rex` for amd64 and arm64, with SBOM and provenance
+attestations.
 
 ## License
 
