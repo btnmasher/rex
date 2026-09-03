@@ -630,6 +630,31 @@ func TestAlertColorDefaults(t *testing.T) {
 			expectedColor: colorInformational,
 		},
 		{
+			name:          "structure unanchoring",
+			event:         notifications.Event{AlertType: notifications.AlertStructureUnanchoring, NotificationType: "StructureUnanchoring"},
+			expectedColor: colorWarning,
+		},
+		{
+			name:          "structure high power",
+			event:         notifications.Event{AlertType: notifications.AlertStructureWentHighPower, NotificationType: "StructureWentHighPower"},
+			expectedColor: colorSuccess,
+		},
+		{
+			name:          "structure online",
+			event:         notifications.Event{AlertType: notifications.AlertStructureOnline, NotificationType: "StructureOnline"},
+			expectedColor: colorSuccess,
+		},
+		{
+			name:          "reinforcement changed",
+			event:         notifications.Event{AlertType: notifications.AlertStructuresReinforcementChanged, NotificationType: "StructuresReinforcementChanged"},
+			expectedColor: colorWarning,
+		},
+		{
+			name:          "structure vulnerable",
+			event:         notifications.Event{AlertType: notifications.AlertStructureVulnerable, NotificationType: "StructureVulnerable"},
+			expectedColor: colorWarning,
+		},
+		{
 			name:          "ownership transfer",
 			event:         notifications.Event{AlertType: notifications.AlertStructureOwnership, NotificationType: "OwnershipTransferred"},
 			expectedColor: colorInformational,
@@ -642,12 +667,17 @@ func TestAlertColorDefaults(t *testing.T) {
 		{
 			name:          "ess",
 			event:         notifications.Event{AlertType: notifications.AlertESSMainBankLink},
-			expectedColor: colorWarning,
+			expectedColor: colorDanger,
 		},
 		{
 			name:          "fuel",
 			event:         notifications.Event{AlertType: notifications.AlertStructureFuelAlert},
 			expectedColor: colorWarning,
+		},
+		{
+			name:          "no reagents",
+			event:         notifications.Event{AlertType: notifications.AlertStructureNoReagents},
+			expectedColor: colorDanger,
 		},
 		{
 			name:          "services offline",
@@ -668,6 +698,16 @@ func TestAlertColorDefaults(t *testing.T) {
 			name:          "sovereignty lost",
 			event:         notifications.Event{AlertType: notifications.AlertSovAllClaimLostMsg, NotificationType: "SovAllClaimLostMsg"},
 			expectedColor: colorDanger,
+		},
+		{
+			name:          "sovereignty exited reinforce",
+			event:         notifications.Event{AlertType: notifications.AlertSovStationExitedReinforce, NotificationType: "SovStationExitedReinforce"},
+			expectedColor: colorWarning,
+		},
+		{
+			name:          "self-destruct canceled",
+			event:         notifications.Event{AlertType: notifications.AlertSovStructureSelfDestructCancel, NotificationType: "SovStructureSelfDestructCancel"},
+			expectedColor: colorWarning,
 		},
 	}
 	for _, test := range tests {

@@ -54,7 +54,7 @@ var eventDescriptionTemplates = map[string]string{
 	"StructureReinforced":                       "A structure has entered reinforced mode in %s.",
 	"StructureOnline":                           "A structure has come online in %s.",
 	"StructureWentLowPower":                     "A structure has entered low power mode in %s.",
-	"StructureWentHighPower":                    "A structure has entered high power mode in %s.",
+	"StructureWentHighPower":                    "A structure has entered full power mode in %s.",
 	"StructuresReinforcementChanged":            "The reinforcement schedule changed for structures in %s.",
 	"StructureServicesOffline":                  "Services on a structure are offline in %s.",
 	"StructureFuelAlert":                        "A structure has a fuel warning in %s.",
@@ -1301,19 +1301,21 @@ func alertColor(event *notifications.Event) int {
 		return colorDanger
 	}
 	switch {
-	case isGainingSovereignty(event.NotificationType):
+	case isGainingSovereignty(event.NotificationType), event.AlertType == notifications.AlertStructureOnline, event.NotificationType == "StructureOnline", event.AlertType == notifications.AlertStructureWentHighPower, event.NotificationType == "StructureWentHighPower":
 		return colorSuccess
-	case event.NotificationType == "StructureAnchoring", event.NotificationType == "StructureOnline", event.NotificationType == "StructureWentHighPower", event.NotificationType == "SkyhookOnline", event.NotificationType == "SkyhookDeployed", event.NotificationType == "StationServiceEnabled":
+	case event.NotificationType == "StructureAnchoring", event.AlertType == notifications.AlertStructureAnchoring, event.NotificationType == "SkyhookOnline", event.NotificationType == "SkyhookDeployed", event.NotificationType == "StationServiceEnabled":
 		return colorInformational
 	case event.NotificationType == "OwnershipTransferred":
 		return colorInformational
 	case event.NotificationType == "StructureUnderAttack", event.NotificationType == "SkyhookUnderAttack", event.NotificationType == "MercenaryDenAttacked", event.NotificationType == "StructureLostShields", event.NotificationType == "StructureLostArmor", event.NotificationType == "SovStructureSelfDestructRequested", event.NotificationType == "OrbitalAttacked", event.NotificationType == "OrbitalReinforced":
 		return colorDanger
+	case event.AlertType == notifications.AlertESSMainBankLink, event.NotificationType == "ESSMainBankLink", event.AlertType == notifications.AlertStructureNoReagents, event.NotificationType == "StructureNoReagentsAlert":
+		return colorDanger
 	case event.NotificationType == "TowerAlertMsg":
 		return colorDanger
 	case notifications.AlertTypeInGroup(event.AlertType, notifications.AlertESS):
 		return colorWarning
-	case notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStructureFuel), notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStarbase), event.NotificationType == "StructureServicesOffline", event.NotificationType == "StructureWentLowPower", event.NotificationType == "StationServiceDisabled", event.NotificationType == "MercenaryDenNewMTO":
+	case event.AlertType == notifications.AlertStructureUnanchoring, event.NotificationType == "StructureUnanchoring", event.AlertType == notifications.AlertSovStationExitedReinforce, event.NotificationType == "SovStationExitedReinforce", event.AlertType == notifications.AlertStructuresReinforcementChanged, event.NotificationType == "StructuresReinforcementChanged", event.AlertType == notifications.AlertStructureVulnerable, event.NotificationType == "StructureVulnerable", event.AlertType == notifications.AlertSovStructureSelfDestructCancel, event.NotificationType == "SovStructureSelfDestructCancel", notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStructureFuel), notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStarbase), event.NotificationType == "StructureServicesOffline", event.NotificationType == "StructureWentLowPower", event.NotificationType == "StationServiceDisabled", event.NotificationType == "MercenaryDenNewMTO":
 		return colorWarning
 	default:
 		return colorDanger

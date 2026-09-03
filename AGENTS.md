@@ -121,6 +121,7 @@ Always prioritize `mcp-gopls` tools for Go analysis.
 
 - AGENTS.md files are binding work contracts for their subtrees
 - Work products, source materials, instructions, records, assets, and durable docs must stay understandable from the nearest applicable AGENTS.md plus every parent AGENTS.md above it
+- `DEVELOPMENT.md` is the maintainer guide for repository architecture, package ownership, runtime invariants, and development workflows; keep it aligned with implementation changes.
 
 ## Read Before Editing
 
@@ -303,13 +304,14 @@ When the user requests a durable behavior change, record it here or in the relev
   304. Header-derived retry and moving-window delays are trusted up to a
   30-minute safety cap, keyed by the configured ESI client identity.
 - SQLite and PostgreSQL job-store migrations use embedded Goose providers and
-  the `goose_db_version` table. PostgreSQL migrations run only when
-  `JOB_STORE=postgres`; the explicit migration task enforces the same
-  condition. Auth-next tables remain externally owned and are never migrated
-  by Rex.
+  the `goose_db_version` table. Automatic PostgreSQL job-store migrations run
+  only when `JOB_STORE=postgres`; explicit migration commands select their
+  backend by `--store` and require the matching database configuration.
+  Auth-next tables remain externally owned and are never migrated by Rex.
 - `internal/alerts` may run without a structure database; missing enrichment is
   non-fatal, and ownership-transfer alerts use the informational blue default.
-  Both `internal/alerts` and `internal/discord` must keep rendered
+  Full-power structure transitions use the success green default. Both
+  `internal/alerts` and `internal/discord` must keep rendered
   embeds within Discord's published limits and escape upstream or hydrated
   display text before placing it in Markdown-capable fields.
 - Alert filtering is a service-level parent-group/leaf allowlist with

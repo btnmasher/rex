@@ -48,9 +48,6 @@ func migrateSQLite(ctx context.Context) error {
 }
 
 func migratePostgres(ctx context.Context) error {
-	if strings.TrimSpace(os.Getenv("JOB_STORE")) != "postgres" {
-		return errors.New("JOB_STORE must be postgres to apply PostgreSQL job-store migrations")
-	}
 	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")

@@ -116,7 +116,7 @@ var displayNames = map[string]string{
 	"StructureReinforced":                       "Structure Reinforced",
 	"StructureOnline":                           "Structure Online",
 	"StructureWentLowPower":                     "Structure Low Power",
-	"StructureWentHighPower":                    "Structure High Power",
+	"StructureWentHighPower":                    "Structure Full Power",
 	"StructuresReinforcementChanged":            "Structure Reinforcement Schedule Changed",
 	"StructureServicesOffline":                  "Structure Services Offline",
 	"StructureFuelAlert":                        "Structure Fuel Alert",

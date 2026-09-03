@@ -167,11 +167,10 @@ tasks:
       - go -C {{.ROOT}} run ./cmd/rex --migrate --store sqlite
 
   migrate:jobstore:postgres:
-    desc: Apply rex-owned PostgreSQL migrations with Goose.
+    desc: Apply explicit rex-owned PostgreSQL migrations with Goose.
     dotenv:
       - '{{.ROOT}}/.env'
     cmds:
-      - test "$JOB_STORE" = "postgres" || (echo 'JOB_STORE must be postgres to apply PostgreSQL migrations' && exit 1)
       - test -n "$DATABASE_URL" || (echo 'DATABASE_URL is required' && exit 1)
       - go -C {{.ROOT}} run ./cmd/rex --migrate --store postgres
 

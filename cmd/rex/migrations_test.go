@@ -6,13 +6,12 @@ import (
 	"testing"
 )
 
-func TestRunRequiresPostgresJobStore(t *testing.T) {
-	t.Setenv("JOB_STORE_SQLITE_PATH", t.TempDir()+"/job.sqlite")
+func TestRunPostgresMigrationRequiresDatabaseURL(t *testing.T) {
 	t.Setenv("JOB_STORE", "sqlite")
 	t.Setenv("DATABASE_URL", "")
 
 	err := runMigrations(context.Background(), []string{"-store", "postgres"})
-	if err == nil || !strings.Contains(err.Error(), "JOB_STORE must be postgres") {
-		t.Fatalf("run() error = %v, want PostgreSQL job-store guard", err)
+	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL is required") {
+		t.Fatalf("run() error = %v, want DATABASE_URL validation", err)
 	}
 }
