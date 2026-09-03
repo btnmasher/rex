@@ -63,8 +63,8 @@ func (q *Queries) GetSolarSystemDetails(ctx context.Context, dollar_1 []string) 
 
 const getStructuresByIDs = `-- name: GetStructuresByIDs :many
 select
-  cs.structure_id,
-  cs.name,
+	  cs.structure_id,
+	  cs.name,
   cs.type_id,
   cs.type_name,
   coalesce(sh.system_id, mg.system_id, cs.system_id) as system_id,

@@ -450,7 +450,7 @@ func TestClassifyExpandedNotificationPayloads(t *testing.T) {
 			name:      "bulk reinforcement schedule",
 			typeName:  "StructuresReinforcementChanged",
 			alertType: AlertStructuresReinforcementChanged,
-			text:      "allStructureInfo: changed hour: 3 numStructures: 12 weekday: 5 solarSystemID: 30001988",
+			text:      "allStructureInfo: - - 1050629404880 - ZJET-E - VI - 13 - 81826 - - 1052657361104 - EL8-4Q - 4-1 - 81826 hour: 3 numStructures: 12 weekday: 5",
 			check:     assertReinforcementSchedule,
 		},
 	}
@@ -568,6 +568,9 @@ func assertReinforcementSchedule(t *testing.T, event *Event) {
 	}
 	if event.ReinforcementHour == nil || *event.ReinforcementHour != 3 || event.ReinforcementWeekday == nil || *event.ReinforcementWeekday != 5 || event.ReinforcedStructureCount == nil || *event.ReinforcedStructureCount != 12 {
 		t.Fatalf("unexpected reinforcement schedule: %#v", event)
+	}
+	if len(event.StructureIDs) != 2 || event.StructureIDs[0] != "1050629404880" || event.StructureIDs[1] != "1052657361104" {
+		t.Fatalf("unexpected bulk structure IDs: %#v", event.StructureIDs)
 	}
 }
 

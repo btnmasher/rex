@@ -89,6 +89,7 @@ const (
 	regexSubmatchCount                     = 2
 	maxEVEIntervalTicks                    = (1<<63 - 1) / int64(eveTickDuration)
 	maxStructureIDs                        = 16
+	maxBulkStructureIDs                    = 64
 	maxResourceRequirements                = 16
 	eveTickDuration                        = 100 * time.Nanosecond
 	eveEpochOffsetSeconds                  = 11644473600
@@ -98,6 +99,7 @@ const (
 
 var (
 	structureIDPattern         = regexp.MustCompile(`(?i)(?:structure[_ -]?id|structureid)\D{0,24}(\d{5,})`)
+	bulkStructureIDPattern     = regexp.MustCompile(`(?:^|\s)-\s*-\s*(\d{5,})(?:\s|$)`)
 	systemIDPattern            = regexp.MustCompile(`(?i)(?:solar[_ -]?system[_ -]?id|system[_ -]?id|solarsystemid)\D{0,24}(\d{5,})`)
 	numberPattern              = regexp.MustCompile(`\d+`)
 	selectorSegmentPattern     = regexp.MustCompile(`^[a-z0-9_]+$`)
@@ -434,6 +436,9 @@ func Classify(notification *esi.Notification) (Event, bool) {
 	text := PlainText(notification.Text)
 	metadata := extractMetadata(text)
 	structureIDs := uniqueMatches(structureIDPattern, text)
+	if notification.Type == "StructuresReinforcementChanged" {
+		structureIDs = uniqueMatchesLimit(bulkStructureIDPattern, metadata["allstructureinfo"], maxBulkStructureIDs)
+	}
 	if structureID := structureIDFromMetadata(metadata["structureid"]); structureID != "" {
 		structureIDs = []string{structureID}
 	}
@@ -651,9 +656,16 @@ func PlainText(value string) string {
 }
 
 func uniqueMatches(pattern *regexp.Regexp, value string) []string {
-	matches := pattern.FindAllStringSubmatch(value, maxStructureIDs)
+	return uniqueMatchesLimit(pattern, value, maxStructureIDs)
+}
+
+func uniqueMatchesLimit(pattern *regexp.Regexp, value string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	matches := pattern.FindAllStringSubmatch(value, limit)
 	seen := make(map[string]struct{}, len(matches))
-	out := make([]string, 0, min(len(matches), maxStructureIDs))
+	out := make([]string, 0, min(len(matches), limit))
 	for _, match := range matches {
 		if len(match) < regexSubmatchCount {
 			continue
@@ -663,7 +675,7 @@ func uniqueMatches(pattern *regexp.Regexp, value string) []string {
 		}
 		seen[match[1]] = struct{}{}
 		out = append(out, match[1])
-		if len(out) == maxStructureIDs {
+		if len(out) == limit {
 			break
 		}
 	}

@@ -6,8 +6,8 @@ order by corporation_id;
 
 -- name: GetStructuresByIDs :many
 select
-  cs.structure_id,
-  cs.name,
+	  cs.structure_id,
+	  cs.name,
   cs.type_id,
   cs.type_name,
   coalesce(sh.system_id, mg.system_id, cs.system_id) as system_id,

@@ -21,28 +21,29 @@ import (
 )
 
 const (
-	colorDanger              = 0xD7263D
-	colorWarning             = 0xF1C40F
-	colorSuccess             = 0x2ECC71
-	colorInformational       = 0x2D6CDF
-	maxTextSize              = 3800
-	maxStructureSummarySize  = 1024
-	maxIntegrityValues       = 3
-	maxAttackerParts         = 3
-	maxOwnershipParts        = 2
-	maxTimerFields           = 4
-	maxActivityFields        = 4
-	maxScheduleValues        = 3
-	maxLoggedPayloadBytes    = 128 << 10
-	discordTimestampFull     = "F"
-	discordTimestampRelative = "R"
-	allianceLogoURL          = "https://images.evetech.net/alliances/%s/logo?size=64"
-	corporationLogoURL       = "https://images.evetech.net/corporations/%s/logo?size=64"
-	eveWhoCharacterURL       = "https://evewho.com/character/%s"
-	eveWhoCorporationURL     = "https://evewho.com/corporation/%s"
-	eveWhoAllianceURL        = "https://evewho.com/alliance/%s"
-	dotlanSystemURL          = "https://evemaps.dotlan.net/system/%s"
-	dotlanRegionURL          = "https://evemaps.dotlan.net/region/%s"
+	colorDanger                   = 0xD7263D
+	colorWarning                  = 0xF1C40F
+	colorSuccess                  = 0x2ECC71
+	colorInformational            = 0x2D6CDF
+	maxTextSize                   = 3800
+	maxStructureSummarySize       = 1024
+	maxIntegrityValues            = 3
+	maxAttackerParts              = 3
+	maxOwnershipParts             = 2
+	maxTimerFields                = 4
+	maxActivityFields             = 4
+	maxScheduleValues             = 3
+	maxLoggedPayloadBytes         = 128 << 10
+	reinforcementWeekdayUnchanged = 255
+	discordTimestampFull          = "F"
+	discordTimestampRelative      = "R"
+	allianceLogoURL               = "https://images.evetech.net/alliances/%s/logo?size=64"
+	corporationLogoURL            = "https://images.evetech.net/corporations/%s/logo?size=64"
+	eveWhoCharacterURL            = "https://evewho.com/character/%s"
+	eveWhoCorporationURL          = "https://evewho.com/corporation/%s"
+	eveWhoAllianceURL             = "https://evewho.com/alliance/%s"
+	dotlanSystemURL               = "https://evemaps.dotlan.net/system/%s"
+	dotlanRegionURL               = "https://evemaps.dotlan.net/region/%s"
 )
 
 var eventDescriptionTemplates = map[string]string{
@@ -140,10 +141,18 @@ type Destination struct {
 	AlertTypes              []string
 	ExcludeAlertTypes       []string
 	ExcludeStructureTypeIDs []string
+	IncludeCorporationIDs   []string
+	ExcludeCorporationIDs   []string
 	routing                 alertRouting
+	corporations            corporationFilter
 }
 
 type alertRouting struct {
+	included map[string]struct{}
+	excluded map[string]struct{}
+}
+
+type corporationFilter struct {
 	included map[string]struct{}
 	excluded map[string]struct{}
 }
@@ -237,12 +246,15 @@ func cloneDestinations(values []Destination) ([]Destination, error) {
 		clones[i].AlertTypes = append([]string(nil), values[i].AlertTypes...)
 		clones[i].ExcludeAlertTypes = append([]string(nil), values[i].ExcludeAlertTypes...)
 		clones[i].ExcludeStructureTypeIDs = append([]string(nil), values[i].ExcludeStructureTypeIDs...)
+		clones[i].IncludeCorporationIDs = append([]string(nil), values[i].IncludeCorporationIDs...)
+		clones[i].ExcludeCorporationIDs = append([]string(nil), values[i].ExcludeCorporationIDs...)
 		clones[i].WebhookURLs = append([]string(nil), values[i].WebhookURLs...)
 		routing, err := compileAlertRouting(clones[i].AlertTypes, clones[i].ExcludeAlertTypes)
 		if err != nil {
 			return nil, fmt.Errorf("destination %q: %w", clones[i].ID, err)
 		}
 		clones[i].routing = routing
+		clones[i].corporations = compileCorporationFilter(clones[i].IncludeCorporationIDs, clones[i].ExcludeCorporationIDs)
 	}
 	return clones, nil
 }
@@ -256,7 +268,7 @@ func (s *Service) Deliver(ctx context.Context, request *DeliveryRequest) error {
 		return nil
 	}
 	requested := requestedDestinationIDs(request)
-	matching := s.matchingDestinations(requested, request.Event.AlertType)
+	matching := s.matchingDestinations(requested, request.Corporation.ID, request.Event.AlertType)
 	if len(matching) == 0 {
 		s.logger.Debug("alert has no configured destinations",
 			"notification_id", request.Event.NotificationID,
@@ -288,11 +300,11 @@ func requestedDestinationIDs(request *DeliveryRequest) map[string]struct{} {
 	return requested
 }
 
-func (s *Service) matchingDestinations(requested map[string]struct{}, alertType string) []Destination {
+func (s *Service) matchingDestinations(requested map[string]struct{}, corporationID, alertType string) []Destination {
 	matching := make([]Destination, 0, len(s.destinations))
 	for i := range s.destinations {
 		destination := &s.destinations[i]
-		if destinationSelected(requested, destination) && destination.routing.supports(alertType) {
+		if destinationSelected(requested, destination) && destination.corporations.supports(corporationID) && destination.routing.supports(alertType) {
 			matching = append(matching, *destination)
 		}
 	}
@@ -345,7 +357,9 @@ func (s *Service) buildEventView(ctx context.Context, request *DeliveryRequest) 
 		}
 	}
 	s.enrichStructures(ctx, structures)
+	event.StructureTypeID = structureTypeIDForEvent(&event, structures)
 	structureTypeName := s.resolveStructureTypeName(ctx, event.StructureTypeID, structures)
+	structureTypeNames := s.resolveStructureTypeNames(ctx, structures)
 	location := s.resolveLocation(ctx, event.SystemID)
 	if event.AllianceID == "" && location.AllianceID != "" {
 		event.AllianceID = location.AllianceID
@@ -394,6 +408,7 @@ func (s *Service) buildEventView(ctx context.Context, request *DeliveryRequest) 
 		PollingCorporationName:   request.Corporation.Name,
 		PollingCorporationTicker: request.Corporation.Ticker,
 		StructureTypeName:        structureTypeName,
+		StructureTypeNames:       structureTypeNames,
 	}
 	if event.OwnerCorporationID != "" {
 		view.CorporationID = event.OwnerCorporationID
@@ -449,6 +464,27 @@ func (s *Service) resolveStructureTypeName(ctx context.Context, typeID string, s
 		return ""
 	}
 	return name
+}
+
+func (s *Service) resolveStructureTypeNames(ctx context.Context, structures []authnextdb.Structure) map[string]string {
+	names := make(map[string]string, len(structures))
+	for index := range structures {
+		typeID := strings.TrimSpace(structures[index].TypeID)
+		if typeID == "" {
+			continue
+		}
+		if _, resolved := names[typeID]; resolved {
+			continue
+		}
+		name := optionalString(structures[index].TypeName)
+		if name == "" {
+			name = s.resolveStructureTypeName(ctx, typeID, nil)
+		}
+		if name != "" {
+			names[typeID] = name
+		}
+	}
+	return names
 }
 
 func (s *Service) resolveCelestial(ctx context.Context, kind, id string) (universe.Entity, error) {
@@ -903,6 +939,32 @@ func (r alertRouting) supports(alertType string) bool {
 	return included
 }
 
+func compileCorporationFilter(included, excluded []string) corporationFilter {
+	filter := corporationFilter{
+		included: make(map[string]struct{}, len(included)),
+		excluded: make(map[string]struct{}, len(excluded)),
+	}
+	for _, corporationID := range included {
+		filter.included[strings.TrimSpace(corporationID)] = struct{}{}
+	}
+	for _, corporationID := range excluded {
+		filter.excluded[strings.TrimSpace(corporationID)] = struct{}{}
+	}
+	return filter
+}
+
+func (f corporationFilter) supports(corporationID string) bool {
+	corporationID = strings.TrimSpace(corporationID)
+	if _, excluded := f.excluded[corporationID]; excluded {
+		return false
+	}
+	if len(f.included) == 0 {
+		return true
+	}
+	_, included := f.included[corporationID]
+	return included
+}
+
 func supports(alertTypes, excludedAlertTypes []string, alertType string) bool {
 	routing, err := compileAlertRouting(alertTypes, excludedAlertTypes)
 	return err == nil && routing.supports(alertType)
@@ -910,6 +972,14 @@ func supports(alertTypes, excludedAlertTypes []string, alertType string) bool {
 
 func destinationExcludesStructureType(destination *Destination, view *eventView) bool {
 	if destination == nil || view == nil || len(destination.ExcludeStructureTypeIDs) == 0 {
+		return false
+	}
+	if view.Event.NotificationType == "StructuresReinforcementChanged" {
+		for i := range view.Structures {
+			if slices.Contains(destination.ExcludeStructureTypeIDs, strings.TrimSpace(view.Structures[i].TypeID)) {
+				return true
+			}
+		}
 		return false
 	}
 	if typeID := strings.TrimSpace(view.Event.StructureTypeID); typeID != "" {
@@ -936,6 +1006,28 @@ func structureTypeID(view *eventView) string {
 		}
 	}
 	return ""
+}
+
+func structureTypeIDFromStructures(typeID string, structures []authnextdb.Structure) string {
+	if typeID = strings.TrimSpace(typeID); typeID != "" {
+		return typeID
+	}
+	for index := range structures {
+		if typeID := strings.TrimSpace(structures[index].TypeID); typeID != "" {
+			return typeID
+		}
+	}
+	return ""
+}
+
+func structureTypeIDForEvent(event *notifications.Event, structures []authnextdb.Structure) string {
+	if event == nil {
+		return ""
+	}
+	if event.NotificationType == "StructuresReinforcementChanged" {
+		return ""
+	}
+	return structureTypeIDFromStructures(event.StructureTypeID, structures)
 }
 
 func (s *Service) logDestinationsResolved(request *DeliveryRequest, count int) {
@@ -973,11 +1065,27 @@ type eventView struct {
 	Event                    notifications.Event
 	Structures               []authnextdb.Structure
 	StructureTypeName        string
+	StructureTypeNames       map[string]string
 	CharacterID              string
 	RawNotificationJSON      []byte
 	PollingCorporationID     string
 	PollingCorporationName   string
 	PollingCorporationTicker string
+}
+
+type reinforcementCoverageRegion struct {
+	label   string
+	systems map[string]reinforcementCoverageSystem
+}
+
+type reinforcementCoverageSystem struct {
+	label string
+	types map[string]reinforcementCoverageType
+}
+
+type reinforcementCoverageType struct {
+	label string
+	count int
 }
 
 func render(view *eventView, senderName, avatarURL string) discord.Message {
@@ -1114,6 +1222,9 @@ func systemFields(view *eventView) []discord.Field {
 	if view == nil {
 		return nil
 	}
+	if view.Event.NotificationType == "StructuresReinforcementChanged" && view.Event.SystemID == "" {
+		return nil
+	}
 	system := view.SystemName
 	if view.Event.SystemID == "" {
 		system = escapeMarkdown(strings.TrimSpace(system))
@@ -1130,6 +1241,9 @@ func regionFields(view *eventView) []discord.Field {
 	if view == nil {
 		return nil
 	}
+	if view.Event.NotificationType == "StructuresReinforcementChanged" && view.Event.SystemID == "" {
+		return nil
+	}
 	region := view.RegionName
 	if view.RegionID == "" {
 		region = escapeMarkdown(strings.TrimSpace(region))
@@ -1140,6 +1254,166 @@ func regionFields(view *eventView) []discord.Field {
 		return []discord.Field{{Name: "Region", Value: region, Inline: true}}
 	}
 	return nil
+}
+
+func reinforcementSystemLabels(view *eventView) []string {
+	if view == nil {
+		return nil
+	}
+	labels := make(map[string]string, len(view.Structures))
+	for index := range view.Structures {
+		structure := &view.Structures[index]
+		id := strings.TrimSpace(structure.SystemID)
+		name := optionalString(structure.SystemName)
+		label := systemLabel(id, name, view.ShowEntityIDs)
+		if label == "" {
+			continue
+		}
+		key := id
+		if key == "" {
+			key = name
+		}
+		labels[key] = label
+	}
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		out = append(out, label)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func reinforcementCoverageField(view *eventView) []discord.Field {
+	if view == nil {
+		return nil
+	}
+	regions := reinforcementCoverageGroups(view)
+	if len(regions) == 0 {
+		return nil
+	}
+	regionKeys := make([]string, 0, len(regions))
+	for regionKey := range regions {
+		regionKeys = append(regionKeys, regionKey)
+	}
+	slices.Sort(regionKeys)
+	lines := make([]string, 0)
+	for _, regionKey := range regionKeys {
+		region := regions[regionKey]
+		lines = append(lines, region.label)
+		lines = append(lines, reinforcementCoverageSystemLines(region)...)
+	}
+	return []discord.Field{{Name: "Structure Coverage", Value: truncate(strings.Join(lines, "\n"), maxStructureSummarySize), Inline: false}}
+}
+
+func reinforcementCoverageGroups(view *eventView) map[string]*reinforcementCoverageRegion {
+	regions := make(map[string]*reinforcementCoverageRegion, len(view.Structures))
+	for index := range view.Structures {
+		structure := &view.Structures[index]
+		regionKey, regionLabel, systemKey, systemLabel := reinforcementCoverageLocation(view, structure)
+		region := regions[regionKey]
+		if region == nil {
+			region = &reinforcementCoverageRegion{label: regionLabel, systems: make(map[string]reinforcementCoverageSystem)}
+			regions[regionKey] = region
+		}
+		system := region.systems[systemKey]
+		if system.label == "" {
+			system.label = systemLabel
+			system.types = make(map[string]reinforcementCoverageType)
+		}
+		typeKey, typeLabel := reinforcementCoverageTypeLabel(view, structure)
+		structureType := system.types[typeKey]
+		structureType.label = typeLabel
+		structureType.count++
+		system.types[typeKey] = structureType
+		region.systems[systemKey] = system
+	}
+	return regions
+}
+
+func reinforcementCoverageLocation(view *eventView, structure *authnextdb.Structure) (regionKey, regionDisplay, systemKey, systemDisplay string) {
+	systemID := strings.TrimSpace(structure.SystemID)
+	systemName := optionalString(structure.SystemName)
+	systemDisplay = systemLabel(systemID, systemName, view.ShowEntityIDs)
+	if systemDisplay == "" {
+		systemDisplay = "Unknown system"
+	}
+	regionID := strings.TrimSpace(optionalString(structure.RegionID))
+	regionName := optionalString(structure.RegionName)
+	regionDisplay = regionLabel(regionID, regionName, view.ShowEntityIDs)
+	if regionDisplay == "" {
+		regionDisplay = "Unknown region"
+	}
+	regionKey = regionID
+	if regionKey == "" {
+		regionKey = regionDisplay
+	}
+	systemKey = systemID
+	if systemKey == "" {
+		systemKey = systemDisplay
+	}
+	return regionKey, regionDisplay, systemKey, systemDisplay
+}
+
+func reinforcementCoverageTypeLabel(view *eventView, structure *authnextdb.Structure) (key, label string) {
+	typeID := strings.TrimSpace(structure.TypeID)
+	label = ""
+	if view.StructureTypeNames != nil {
+		label = strings.TrimSpace(view.StructureTypeNames[typeID])
+	}
+	if label == "" {
+		label = strings.TrimSpace(optionalString(structure.TypeName))
+	}
+	if label == "" && typeID != "" {
+		label = "Structure type " + typeID
+	}
+	if label == "" {
+		label = "Unknown structure type"
+	}
+	key = typeID
+	if key == "" {
+		key = label
+	}
+	return key, label
+}
+
+func reinforcementCoverageSystemLines(region *reinforcementCoverageRegion) []string {
+	if region == nil {
+		return nil
+	}
+	systemKeys := make([]string, 0, len(region.systems))
+	for systemKey := range region.systems {
+		systemKeys = append(systemKeys, systemKey)
+	}
+	slices.Sort(systemKeys)
+	lines := make([]string, 0, len(systemKeys))
+	for _, systemKey := range systemKeys {
+		system := region.systems[systemKey]
+		lines = append(lines, "  "+system.label)
+		typeKeys := reinforcementCoverageTypeKeys(system)
+		for _, typeKey := range typeKeys {
+			coverage := system.types[typeKey]
+			noun := "structures"
+			if coverage.count == 1 {
+				noun = "structure"
+			}
+			lines = append(lines, fmt.Sprintf("    %s - %d %s", coverage.label, coverage.count, noun))
+		}
+	}
+	return lines
+}
+
+func reinforcementCoverageTypeKeys(system reinforcementCoverageSystem) []string {
+	keys := make([]string, 0, len(system.types))
+	for typeKey := range system.types {
+		keys = append(keys, typeKey)
+	}
+	slices.SortFunc(keys, func(left, right string) int {
+		if comparison := strings.Compare(system.types[left].label, system.types[right].label); comparison != 0 {
+			return comparison
+		}
+		return strings.Compare(left, right)
+	})
+	return keys
 }
 
 func planetFields(view *eventView) []discord.Field {
@@ -1165,6 +1439,9 @@ func structureFields(view *eventView) []discord.Field {
 	if view == nil {
 		return nil
 	}
+	if view.Event.NotificationType == "StructuresReinforcementChanged" {
+		return reinforcementCoverageField(view)
+	}
 	lines := make([]string, 0, len(view.Structures))
 	for index := range view.Structures {
 		lines = append(lines, formatStructure(&view.Structures[index], view))
@@ -1182,6 +1459,9 @@ func structureFields(view *eventView) []discord.Field {
 
 func structureTypeFields(view *eventView) []discord.Field {
 	if view == nil {
+		return nil
+	}
+	if view.Event.NotificationType == "StructuresReinforcementChanged" {
 		return nil
 	}
 	structureType := strings.TrimSpace(view.StructureTypeName)
@@ -1418,7 +1698,14 @@ func eventDescription(view *eventView) string {
 		return "A skyhook is under attack in " + system + "."
 	}
 	if event.NotificationType == "StructuresReinforcementChanged" && event.ReinforcedStructureCount != nil {
-		return fmt.Sprintf("The reinforcement schedule changed for %d structures in %s.", *event.ReinforcedStructureCount, system)
+		systems := reinforcementSystemLabels(view)
+		if len(systems) > 1 {
+			return fmt.Sprintf("The reinforcement schedule changed for %d structures across %d solar systems.", *event.ReinforcedStructureCount, len(systems))
+		}
+		if len(systems) == 1 {
+			return fmt.Sprintf("The reinforcement schedule changed for %d structures in %s.", *event.ReinforcedStructureCount, systems[0])
+		}
+		return fmt.Sprintf("The reinforcement schedule changed for %d structures across the reported solar systems.", *event.ReinforcedStructureCount)
 	}
 	if template, ok := eventDescriptionTemplates[event.NotificationType]; ok {
 		return fmt.Sprintf(template, system)
@@ -1479,7 +1766,7 @@ func activityFields(view *eventView) []discord.Field {
 			lines = append(lines, fmt.Sprintf("Structures: %d", *event.ReinforcedStructureCount))
 		}
 		if event.ReinforcementWeekday != nil {
-			lines = append(lines, fmt.Sprintf("Weekday: %d", *event.ReinforcementWeekday))
+			lines = append(lines, "Weekday: "+reinforcementWeekdayLabel(*event.ReinforcementWeekday))
 		}
 		if event.ReinforcementHour != nil {
 			lines = append(lines, fmt.Sprintf("Hour: %02d:00 EVE", *event.ReinforcementHour))
@@ -1487,6 +1774,16 @@ func activityFields(view *eventView) []discord.Field {
 		fields = append(fields, discord.Field{Name: "Reinforcement Schedule", Value: strings.Join(lines, "\n"), Inline: true})
 	}
 	return fields
+}
+
+func reinforcementWeekdayLabel(weekday int) string {
+	if weekday == reinforcementWeekdayUnchanged {
+		return "Unchanged"
+	}
+	if weekday < 0 || weekday >= 7 {
+		return fmt.Sprintf("Unknown (%d)", weekday)
+	}
+	return [...]string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}[weekday]
 }
 
 func attackerIdentityLabel(name, id, fallback string, showEntityIDs bool) string {
@@ -1530,7 +1827,7 @@ func formatStructure(structure *authnextdb.Structure, view *eventView) string {
 
 func structureThumbnail(structures []authnextdb.Structure, fallbackTypeID string) *discord.Image {
 	typeID := fallbackTypeID
-	if typeID == "" && len(structures) > 0 && structures[0].TypeID != "" {
+	if typeID == "" && len(structures) == 1 && structures[0].TypeID != "" {
 		typeID = structures[0].TypeID
 	}
 	if typeID == "" {

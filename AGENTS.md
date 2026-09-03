@@ -314,10 +314,18 @@ When the user requests a durable behavior change, record it here or in the relev
   `internal/alerts` and `internal/discord` must keep rendered
   embeds within Discord's published limits and escape upstream or hydrated
   display text before placing it in Markdown-capable fields.
+- Bulk `StructuresReinforcementChanged` payloads may identify multiple
+  structures without a system ID; parse their bounded structure list and use
+  globally keyed structure enrichment to render deduplicated system and region
+  coverage grouped by region, solar system, and structure type.
+- A `StructuresReinforcementChanged` weekday value of `255` means the weekday
+  was unchanged in the observed EVE notification format; render it as
+  `Unchanged`, not as a calendar day.
 - Alert filtering is a service-level parent-group/leaf allowlist with
-  destination-scoped leaf and structure-type exclusions, while destination
-  mappings are corporation-scoped and many-to-many. Preserve both boundaries
-  when extending notification routing.
+  destination-scoped corporation allowlists/blocklists, leaf exclusions, and
+  structure-type exclusions, while destination mappings are corporation-scoped
+  and many-to-many. Corporation exclusions take precedence over inclusions;
+  preserve both boundaries when extending notification routing.
 - Identical Discord webhook URLs are flattened at the alert delivery boundary;
   one notification must produce at most one delivery per URL.
 - Starbase notification routing uses the canonical `starbase` group with

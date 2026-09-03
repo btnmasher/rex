@@ -95,14 +95,19 @@ destination-scoped leaf exclusions. Exclusions always win over inclusion.
 
 Routing is evaluated in this order:
 
-1. Match the classified leaf against the destination's compiled selectors.
-2. Apply the destination's excluded leaf paths.
-3. Apply excluded structure type IDs using payload type data first and enriched structure data second.
-4. Expand each matching destination into webhook targets.
-5. Flatten duplicate webhook URLs so one notification produces at most one delivery per URL.
+1. Match the polling corporation against the destination's corporation filter.
+2. Match the classified leaf against the destination's compiled selectors.
+3. Apply the destination's excluded leaf paths.
+4. Apply excluded structure type IDs using payload type data first and enriched structure data second.
+5. Expand each matching destination into webhook targets.
+6. Flatten duplicate webhook URLs so one notification produces at most one delivery per URL.
 
 The first matching target wins when the same URL appears in multiple matching
 destinations. Its target ID is retained for retry and alert-history records.
+Corporation filters use the polling corporation ID in `DeliveryRequest`, not a
+payload owner corporation. An empty include list means all corporations; a
+non-empty include list limits delivery to those IDs. Exclusions always win,
+including when an ID appears in both lists.
 Semantic embed colors are static in `internal/alerts`; destination configuration
 does not control colors.
 

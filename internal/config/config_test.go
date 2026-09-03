@@ -100,6 +100,49 @@ func TestLoadAlertDestinationSupportsMultipleWebhookURLs(t *testing.T) {
 	}
 }
 
+func TestLoadAlertDestinationSupportsCorporationFilters(t *testing.T) {
+	setRequiredEnvironment(t)
+	writeDestinationsFile(t, `[{
+		"name":"corporation-alerts",
+		"webhookUrls":["https://discord.com/api/webhooks/123/token"],
+		"alertTypes":["all"],
+		"includeCorporationIDs":[" 000123456789 "],
+		"excludeCorporationIDs":["987654321"]
+	}]`)
+
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	destination := config.AlertDestinations[0]
+	if len(destination.IncludeCorporationIDs) != 1 || destination.IncludeCorporationIDs[0] != "123456789" {
+		t.Fatalf("unexpected included corporation IDs: %#v", destination.IncludeCorporationIDs)
+	}
+	if len(destination.ExcludeCorporationIDs) != 1 || destination.ExcludeCorporationIDs[0] != "987654321" {
+		t.Fatalf("unexpected excluded corporation IDs: %#v", destination.ExcludeCorporationIDs)
+	}
+}
+
+func TestLoadRejectsInvalidCorporationFilter(t *testing.T) {
+	setRequiredEnvironment(t)
+	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"includeCorporationIDs":["not-a-corporation"]}]`)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected invalid corporation filter error")
+	}
+}
+
+func TestLoadRejectsDuplicateCorporationFilter(t *testing.T) {
+	setRequiredEnvironment(t)
+	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"excludeCorporationIDs":["123","000123"]}]`)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected duplicate corporation filter error")
+	}
+}
+
 func TestLoadSupportsDiscordEntityIDVisibility(t *testing.T) {
 	setRequiredEnvironment(t)
 	t.Setenv("DISCORD_SHOW_ENTITY_IDS", "true")

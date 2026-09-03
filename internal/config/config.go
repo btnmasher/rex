@@ -32,6 +32,7 @@ const (
 	defaultAlertDestinations = "alert-destinations.json"
 	maxSenderNameCharacters  = 80
 	maxStructureTypeFilters  = 128
+	maxCorporationFilters    = 128
 )
 
 // Config contains validated runtime settings.
@@ -78,6 +79,8 @@ type AlertDestination struct {
 	AlertTypes              []string `json:"alertTypes"`
 	ExcludeAlertTypes       []string `json:"excludeAlertTypes,omitempty"`
 	ExcludeStructureTypeIDs []string `json:"excludeStructureTypeIDs,omitempty"`
+	IncludeCorporationIDs   []string `json:"includeCorporationIDs,omitempty"`
+	ExcludeCorporationIDs   []string `json:"excludeCorporationIDs,omitempty"`
 }
 
 // Load reads and validates configuration from environment variables.
@@ -255,6 +258,9 @@ func validateAlertDestination(path string, index int, destination *AlertDestinat
 	if err := validateStructureTypeIDs(destination.Name, destination.ExcludeStructureTypeIDs); err != nil {
 		return fmt.Errorf("ALERT_DESTINATIONS_FILE %q: %w", path, err)
 	}
+	if err := validateCorporationIDs(destination.Name, destination.IncludeCorporationIDs, destination.ExcludeCorporationIDs); err != nil {
+		return fmt.Errorf("ALERT_DESTINATIONS_FILE %q: %w", path, err)
+	}
 	return nil
 }
 
@@ -335,6 +341,34 @@ func validateStructureTypeIDs(destinationName string, values []string) error {
 		value = strconv.FormatUint(parsed, 10)
 		if _, ok := seen[value]; ok {
 			return fmt.Errorf("destination %q contains duplicate excluded structure type ID %q", destinationName, value)
+		}
+		seen[value] = struct{}{}
+		values[i] = value
+	}
+	return nil
+}
+
+func validateCorporationIDs(destinationName string, included, excluded []string) error {
+	if err := normalizeCorporationIDs(destinationName, "includeCorporationIDs", included); err != nil {
+		return err
+	}
+	return normalizeCorporationIDs(destinationName, "excludeCorporationIDs", excluded)
+}
+
+func normalizeCorporationIDs(destinationName, fieldName string, values []string) error {
+	if len(values) > maxCorporationFilters {
+		return fmt.Errorf("destination %q has more than %d %s", destinationName, maxCorporationFilters, fieldName)
+	}
+	seen := make(map[string]struct{}, len(values))
+	for i := range values {
+		value := strings.TrimSpace(values[i])
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || parsed == 0 {
+			return fmt.Errorf("destination %q has invalid %s value %q", destinationName, fieldName, value)
+		}
+		value = strconv.FormatUint(parsed, 10)
+		if _, ok := seen[value]; ok {
+			return fmt.Errorf("destination %q contains duplicate %s value %q", destinationName, fieldName, value)
 		}
 		seen[value] = struct{}{}
 		values[i] = value

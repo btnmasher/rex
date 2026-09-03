@@ -77,7 +77,9 @@ destination has:
   "webhookUrls": ["https://discord.com/api/webhooks/replace-me"],
   "alertTypes": ["structures.combat"],
   "excludeAlertTypes": ["structures.combat.destroyed"],
-  "excludeStructureTypeIDs": ["85230"]
+  "excludeStructureTypeIDs": ["85230"],
+  "includeCorporationIDs": ["123456789"],
+  "excludeCorporationIDs": ["987654321"]
 }
 ```
 
@@ -86,6 +88,9 @@ destination has:
 - `alertTypes` accepts canonical groups or individual leaf paths.
 - `excludeAlertTypes` accepts leaf paths only and overrides all inclusions.
 - `excludeStructureTypeIDs` suppresses matching EVE structure types. Missing type data fails open.
+- `includeCorporationIDs` limits delivery to alerts polled through the listed corporations.
+- `excludeCorporationIDs` suppresses delivery for the listed polling corporations.
+- With neither corporation list, all corporations are accepted; with only one list, it acts as the allowlist or blocklist. When both are set, exclusions take precedence.
 - Duplicate webhook URLs across destinations are flattened, so one alert is sent at most once per URL.
 - `all` or `*` includes every leaf and must be the only included selector.
 - Alert selectors are case-insensitive; groups may use either `group` or `group.*`.

@@ -28,6 +28,11 @@ type structureLookupAlertDatabase struct {
 	requestedStructureIDs []string
 }
 
+type bulkStructureAlertDatabase struct {
+	structures            []authnextdb.Structure
+	requestedStructureIDs []string
+}
+
 func (emptyStructureAlertDatabase) GetStructuresByIDs(context.Context, []string) ([]authnextdb.Structure, error) {
 	return nil, nil
 }
@@ -39,6 +44,11 @@ func (failingStructureAlertDatabase) GetStructuresByIDs(context.Context, []strin
 func (d *structureLookupAlertDatabase) GetStructuresByIDs(_ context.Context, structureIDs []string) ([]authnextdb.Structure, error) {
 	d.requestedStructureIDs = append([]string(nil), structureIDs...)
 	return nil, nil
+}
+
+func (d *bulkStructureAlertDatabase) GetStructuresByIDs(_ context.Context, structureIDs []string) ([]authnextdb.Structure, error) {
+	d.requestedStructureIDs = append([]string(nil), structureIDs...)
+	return d.structures, nil
 }
 
 func (alertTestDatabase) GetStructuresByIDs(context.Context, []string) ([]authnextdb.Structure, error) {
@@ -357,6 +367,66 @@ func TestDeliverDeduplicatesSharedWebhookURLsAcrossDestinations(t *testing.T) {
 	}
 }
 
+func TestDeliverFiltersDestinationsByPollingCorporation(t *testing.T) {
+	delivery := &alertTestDelivery{}
+	service, err := NewService(emptyStructureAlertDatabase{}, delivery, &Config{
+		Destinations: []Destination{
+			{
+				ID:                    "included",
+				AlertTypes:            []string{notifications.AlertStructureUnderAttack},
+				IncludeCorporationIDs: []string{"100"},
+				WebhookURLs:           []string{"https://webhook-included"},
+			},
+			{
+				ID:                    "excluded",
+				AlertTypes:            []string{notifications.AlertStructureUnderAttack},
+				ExcludeCorporationIDs: []string{"100"},
+				WebhookURLs:           []string{"https://webhook-excluded"},
+			},
+			{
+				ID:          "unrestricted",
+				AlertTypes:  []string{notifications.AlertStructureUnderAttack},
+				WebhookURLs: []string{"https://webhook-unrestricted"},
+			},
+			{
+				ID:                    "overridden",
+				AlertTypes:            []string{notifications.AlertStructureUnderAttack},
+				IncludeCorporationIDs: []string{"100"},
+				ExcludeCorporationIDs: []string{"100"},
+				WebhookURLs:           []string{"https://webhook-overridden"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	request := func(notificationID int64, corporationID string) *DeliveryRequest {
+		return &DeliveryRequest{
+			Corporation: authnextdb.Corporation{ID: corporationID, Name: "Corp"},
+			Event: &notifications.Event{
+				NotificationID:   notificationID,
+				NotificationType: "StructureUnderAttack",
+				AlertType:        notifications.AlertStructureUnderAttack,
+			},
+		}
+	}
+	if err := service.Deliver(context.Background(), request(1, "100")); err != nil {
+		t.Fatalf("deliver included corporation alert: %v", err)
+	}
+	if !sameStrings(delivery.urls, []string{"https://webhook-included", "https://webhook-unrestricted"}) {
+		t.Fatalf("corporation 100 destinations = %#v", delivery.urls)
+	}
+
+	delivery.urls = nil
+	if err := service.Deliver(context.Background(), request(2, "200")); err != nil {
+		t.Fatalf("deliver unrestricted corporation alert: %v", err)
+	}
+	if !sameStrings(delivery.urls, []string{"https://webhook-excluded", "https://webhook-unrestricted"}) {
+		t.Fatalf("corporation 200 destinations = %#v", delivery.urls)
+	}
+}
+
 func TestDeliverFiltersDestinationByPayloadStructureType(t *testing.T) {
 	delivery := &alertTestDelivery{}
 	service, err := NewService(alertTestDatabase{}, delivery, &Config{
@@ -556,6 +626,49 @@ func TestDeliverUsesStructureIDsForStructureEnrichment(t *testing.T) {
 	}
 	if len(database.requestedStructureIDs) != 1 || database.requestedStructureIDs[0] != "123456789" {
 		t.Fatalf("structure lookup IDs = %#v, want [123456789]", database.requestedStructureIDs)
+	}
+}
+
+func TestBuildEventViewGroupsBulkReinforcementCoverage(t *testing.T) {
+	firstSystem := "ZJET-E"
+	secondSystem := "EL8-4Q"
+	regionID := "10000015"
+	region := "Pure Blind"
+	firstTypeName := "Metenox Moon Drill"
+	secondTypeName := "Astrahus"
+	thirdTypeName := "Raitaru"
+	count := 53
+	weekday := 255
+	database := &bulkStructureAlertDatabase{structures: []authnextdb.Structure{
+		{ID: "1050629404880", TypeID: "81826", TypeName: &firstTypeName, SystemID: "30002901", SystemName: &firstSystem, RegionID: &regionID, RegionName: &region},
+		{ID: "1050629404881", TypeID: "81826", TypeName: &firstTypeName, SystemID: "30002901", SystemName: &firstSystem, RegionID: &regionID, RegionName: &region},
+		{ID: "1050629404882", TypeID: "35833", TypeName: &thirdTypeName, SystemID: "30002901", SystemName: &firstSystem, RegionID: &regionID, RegionName: &region},
+		{ID: "1052657361104", TypeID: "35832", TypeName: &secondTypeName, SystemID: "30002902", SystemName: &secondSystem, RegionID: &regionID, RegionName: &region},
+	}}
+	service := &Service{database: database, logger: slog.Default()}
+	view, err := service.buildEventView(context.Background(), &DeliveryRequest{Corporation: authnextdb.Corporation{ID: "999", Name: "Polling Corporation"}, Event: &notifications.Event{
+		NotificationType:         "StructuresReinforcementChanged",
+		AlertType:                notifications.AlertStructuresReinforcementChanged,
+		StructureIDs:             []string{"1050629404880", "1050629404881", "1050629404882", "1052657361104"},
+		ReinforcedStructureCount: &count,
+		ReinforcementWeekday:     &weekday,
+	}})
+	if err != nil {
+		t.Fatalf("build event view: %v", err)
+	}
+	if len(database.requestedStructureIDs) != 4 {
+		t.Fatalf("structure lookup IDs = %#v, want four IDs", database.requestedStructureIDs)
+	}
+	message := render(view, "Rex", "")
+	embed := message.Embeds[0]
+	if embed.Description != "The reinforcement schedule changed for 53 structures across 2 solar systems." {
+		t.Fatalf("unexpected description: %q", embed.Description)
+	}
+	if !hasField(embed.Fields, "Structure Coverage", "[Pure Blind](https://evemaps.dotlan.net/region/Pure_Blind)\n  [ZJET-E](https://evemaps.dotlan.net/system/ZJET-E)\n    Metenox Moon Drill - 2 structures\n    Raitaru - 1 structure\n  [EL8-4Q](https://evemaps.dotlan.net/system/EL8-4Q)\n    Astrahus - 1 structure") {
+		t.Fatalf("missing structure coverage summary: %#v", embed.Fields)
+	}
+	if !hasField(embed.Fields, "Reinforcement Schedule", "Structures: 53\nWeekday: Unchanged") {
+		t.Fatalf("missing reinforcement weekday summary: %#v", embed.Fields)
 	}
 }
 
@@ -1124,4 +1237,16 @@ func hasFieldNamed(fields []discord.Field, name string) bool {
 	}
 
 	return false
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

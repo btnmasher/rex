@@ -69,6 +69,8 @@ func runDiscordDebug(ctx context.Context) error {
 			AlertTypes:              destination.AlertTypes,
 			ExcludeAlertTypes:       destination.ExcludeAlertTypes,
 			ExcludeStructureTypeIDs: destination.ExcludeStructureTypeIDs,
+			IncludeCorporationIDs:   destination.IncludeCorporationIDs,
+			ExcludeCorporationIDs:   destination.ExcludeCorporationIDs,
 		})
 	}
 	alertService, err := alerts.NewService(debugDatabase{}, delivery, &alerts.Config{
