@@ -1,0 +1,17 @@
+services:
+  rex:
+    image: rex-notification-service:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      NOTIFICATION_STATE_SQLITE_PATH: /data/rex-notification-state.sqlite
+      ALERT_DESTINATIONS_FILE: /etc/rex/alert-destinations.json
+    volumes:
+      - rex-state:/data
+      - ./alert-destinations.json:/etc/rex/alert-destinations.json:ro
+    restart: unless-stopped
+volumes:
+  rex-state:

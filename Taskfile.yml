@@ -1,0 +1,221 @@
+version: '3'
+
+silent: true
+
+vars:
+  ROOT: '{{.TASKFILE_DIR}}'
+  JOBRUNTIME_DIR: '{{.ROOT}}/lib/jobruntime'
+  BIN_DIR: '{{.ROOT}}/.tmp/bin'
+  IMAGE: 'rex-notification-service:local'
+  SQLC_VERSION: 'v1.31.1'
+  GOLANGCI_VERSION: 'v2.13.0'
+
+tasks:
+  default:
+    desc: Run the full local verification suite.
+    cmds:
+      - task: verify
+
+  setup:
+    desc: Check backend tools and download Go dependencies.
+    cmds:
+      - command -v task >/dev/null || (echo 'task is required' && exit 1)
+      - command -v go >/dev/null || (echo 'go is required' && exit 1)
+      - command -v sqlc >/dev/null && sqlc version | grep -q '{{.SQLC_VERSION}}' || go install github.com/sqlc-dev/sqlc/cmd/sqlc@{{.SQLC_VERSION}}
+      - command -v golangci-lint >/dev/null && golangci-lint version | grep -q 'version 2.13.0' || go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_VERSION}}
+      - go -C {{.JOBRUNTIME_DIR}} mod download
+      - go -C {{.ROOT}} mod download
+      - mkdir -p {{.BIN_DIR}}
+
+  generate:
+    desc: Generate all repository-owned clients.
+    deps:
+      - generate:authnextdb
+      - generate:jobstore
+      - generate:jobstore-sqlite
+      - generate:notificationstate
+
+  generate:authnextdb:
+    desc: Generate the auth-next database client.
+    deps:
+      - setup
+    cmds:
+      - sqlc generate -f {{.ROOT}}/internal/authnextdb/sqlc.yaml
+
+  generate:jobstore:
+    desc: Generate the durable job store client.
+    deps:
+      - setup
+    cmds:
+      - sqlc generate -f {{.JOBRUNTIME_DIR}}/jobstore/postgres/sqlc.yaml
+
+  generate:jobstore-sqlite:
+    desc: Generate the embedded SQLite job store client.
+    deps:
+      - setup
+    cmds:
+      - sqlc generate -f {{.JOBRUNTIME_DIR}}/jobstore/sqlite/sqlc.yaml
+
+  generate:notificationstate:
+    desc: Generate the durable notification cursor client.
+    deps:
+      - setup
+    cmds:
+      - sqlc generate -f {{.ROOT}}/internal/notificationstate/sqlite/sqlc.yaml
+
+  format:
+    desc: Format all Go modules.
+    cmds:
+      - go -C {{.JOBRUNTIME_DIR}} fmt ./...
+      - go -C {{.ROOT}} fmt ./...
+
+  format:check:
+    desc: Verify Go formatting.
+    cmds:
+      - test -z "$(find {{.JOBRUNTIME_DIR}} {{.ROOT}}/cmd {{.ROOT}}/internal -type f -name '*.go' -print0 | xargs -0 gofmt -l)"
+
+  test:
+    desc: Run all Go tests.
+    cmds:
+      - task: test:jobruntime
+      - task: test:service
+
+  test:race:
+    desc: Run all Go tests with the race detector.
+    cmds:
+      - go -C {{.JOBRUNTIME_DIR}} test -race ./...
+      - go -C {{.ROOT}} test -race ./...
+
+  test:jobruntime:
+    desc: Run jobruntime tests.
+    cmds:
+      - go -C {{.JOBRUNTIME_DIR}} test ./...
+
+  test:service:
+    desc: Run service tests.
+    cmds:
+      - go -C {{.ROOT}} test ./...
+
+  vet:
+    desc: Run go vet in both modules.
+    cmds:
+      - go -C {{.JOBRUNTIME_DIR}} vet ./...
+      - go -C {{.ROOT}} vet ./...
+
+  lint:
+    desc: Run golangci-lint in both modules.
+    cmds:
+      - cd {{.JOBRUNTIME_DIR}} && golangci-lint run -c {{.ROOT}}/golangci.yml ./...
+      - cd {{.ROOT}} && golangci-lint run -c {{.ROOT}}/golangci.yml ./...
+
+  tidy:
+    desc: Tidy both Go modules.
+    cmds:
+      - go -C {{.JOBRUNTIME_DIR}} mod tidy
+      - go -C {{.ROOT}} mod tidy
+
+  build:
+    desc: Build the standalone service binary without CGO.
+    cmds:
+      - CGO_ENABLED=0 go -C {{.ROOT}} build -trimpath -o {{.BIN_DIR}}/rex ./cmd/rex
+
+  run:
+    desc: Run locally using the job store configured in .env.
+    dotenv:
+      - '{{.ROOT}}/.env'
+    cmds:
+      - go -C {{.ROOT}} run ./cmd/rex
+
+  run:race:
+    desc: Run locally with the race detector using the job store configured in .env.
+    dotenv:
+      - '{{.ROOT}}/.env'
+    cmds:
+      - go -C {{.ROOT}} run -race ./cmd/rex
+
+  run:debug:race:
+    desc: Run locally with the race detector and debug logging using the job store configured in .env.
+    dotenv:
+      - '{{.ROOT}}/.env'
+    cmds:
+      - go -C {{.ROOT}} run -race ./cmd/rex
+    env:
+      LOG_LEVEL: "DEBUG"
+      LOG_PRETTY: "true"
+      LOG_PAYLOADS: "true"
+
+  debug:discord:
+    desc: Send synthetic alerts through configured Discord destinations.
+    dotenv:
+      - '{{.ROOT}}/.env'
+    cmds:
+      - go -C {{.ROOT}} run ./cmd/rex --discord-debug
+    env:
+      LOG_LEVEL: "DEBUG"
+      LOG_PRETTY: "true"
+
+  migrate:jobstore:
+    desc: Apply rex-owned SQLite migrations with Goose (default).
+    cmds:
+      - task: migrate:jobstore:sqlite
+
+  migrate:jobstore:sqlite:
+    desc: Apply rex-owned SQLite migrations with Goose.
+    dotenv:
+      - '{{.ROOT}}/.env'
+    cmds:
+      - go -C {{.ROOT}} run ./cmd/rex --migrate --store sqlite
+
+  migrate:jobstore:postgres:
+    desc: Apply rex-owned PostgreSQL migrations with Goose.
+    dotenv:
+      - '{{.ROOT}}/.env'
+    cmds:
+      - test "$JOB_STORE" = "postgres" || (echo 'JOB_STORE must be postgres to apply PostgreSQL migrations' && exit 1)
+      - test -n "$DATABASE_URL" || (echo 'DATABASE_URL is required' && exit 1)
+      - go -C {{.ROOT}} run ./cmd/rex --migrate --store postgres
+
+  verify:
+    desc: Run generation and all backend quality gates.
+    cmds:
+      - task: generate
+      - task: format:check
+      - task: test
+      - task: vet
+      - task: lint
+
+  docker:build:
+    desc: Build the standalone service image from the repository root.
+    cmds:
+      - docker build -t {{.IMAGE}} -f {{.ROOT}}/Dockerfile {{.ROOT}}
+
+  docker:up:
+    desc: Start the service in the foreground.
+    cmds:
+      - docker compose -f {{.ROOT}}/docker-compose.yml up
+
+  docker:up:detach:
+    desc: Start the service in the background.
+    cmds:
+      - docker compose -f {{.ROOT}}/docker-compose.yml up -d
+
+  docker:logs:
+    desc: Follow service logs.
+    cmds:
+      - docker compose -f {{.ROOT}}/docker-compose.yml logs -f
+
+  docker:status:
+    desc: Show service status.
+    cmds:
+      - docker compose -f {{.ROOT}}/docker-compose.yml ps
+
+  docker:down:
+    desc: Stop the standalone service.
+    cmds:
+      - docker compose -f {{.ROOT}}/docker-compose.yml down
+
+  docker:restart:
+    desc: Restart the standalone service.
+    cmds:
+      - task: docker:down
+      - task: docker:up:detach

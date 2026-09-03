@@ -1,0 +1,47 @@
+[
+  {
+    "name": "military-alerts",
+    "webhookUrls": [
+      "https://discord.com/api/webhooks/replace-me",
+      "https://discord.com/api/webhooks/replace-me-2"
+    ],
+    "alertTypes": [
+      "sovereignty.entosis",
+      "sovereignty.events",
+      "structures.combat",
+      "starbase.under_attack",
+      "structures.state.reinforced",
+      "structures.state.low_power",
+      "structures.integrity",
+      "skyhooks.under_attack",
+      "skyhooks.lost_shields",
+      "skyhooks.destroyed",
+      "customs_offices"
+    ],
+    "excludeStructureTypeIDs": ["85230", "85980"]
+  },
+  {
+    "name": "logistics-alerts",
+    "webhookUrls": ["https://discord.com/api/webhooks/replace-me"],
+    "alertTypes": [
+      "structures.state",
+      "structures.ownership",
+      "structures.resources",
+      "structures.abandonment",
+      "skyhooks.lost_shields",
+      "skyhooks.destroyed",
+      "skyhooks.online",
+      "skyhooks.deployed",
+      "station_services",
+      "starbase.resource_alert"
+    ]
+  },
+  {
+    "name": "industry-alerts",
+    "webhookUrls": ["https://discord.com/api/webhooks/replace-me"],
+    "alertTypes": [
+      "moonmining",
+      "mercenary_dens"
+    ]
+  }
+]

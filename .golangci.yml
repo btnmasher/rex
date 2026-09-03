@@ -1,0 +1,50 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - errorlint
+    - copyloopvar
+    - gocognit
+    - gocritic
+    - govet
+    - ineffassign
+    - misspell
+    - nestif
+    - noctx
+    - nolintlint
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - wastedassign
+    - modernize
+    - musttag
+    - gosec
+    - contextcheck
+    - bidichk
+    - funcorder
+    - embeddedstructfieldcheck
+    - durationcheck
+    - intrange
+    - mnd
+
+  settings:
+    gocognit:
+      min-complexity: 15
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+    misspell:
+      locale: US
+    nestif:
+      min-complexity: 4
+    revive:
+      rules: []

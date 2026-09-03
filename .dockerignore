@@ -1,0 +1,10 @@
+.git
+.plans/
+.tmp
+.env
+alert-destinations.json
+*.sqlite*
+node_modules
+**/*_test.go
+coverage.out
+internal.cover.out
