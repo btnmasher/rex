@@ -517,7 +517,7 @@ func (p *Poller) processEligibleNotification(
 		)
 		return p.advanceStream(ctx, corporation.ID, characterID, item)
 	}
-	p.logger.Debug("notification claimed for alert delivery",
+	p.logger.Info("notification claimed for alert delivery",
 		"notification_id", item.ID,
 		"alert_type", event.AlertType,
 		"corporation_id", corporation.ID,

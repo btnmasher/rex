@@ -830,7 +830,7 @@ func (s *Service) deliverTarget(ctx context.Context, target *webhookTarget, view
 			"err", err,
 		)
 	}
-	s.logger.Debug("Discord alert delivery completed",
+	s.logger.Info("Discord alert delivery completed",
 		"destination_id", target.ID,
 		"notification_id", view.Event.NotificationID,
 		"duration", time.Since(startedAt),
