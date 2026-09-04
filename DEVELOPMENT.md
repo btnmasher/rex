@@ -354,7 +354,9 @@ option for hosts that require it. The image accepts `VERSION`, `REVISION`, and
 stdout/stderr stream, colorizes the Compose prefix and JSON syntax for the
 terminal, and appends a raw copy to `.logs/rex.log`; it follows only new log
 entries rather than replaying retained container history. Rex itself continues
-to emit logs to stdout/stderr. The task requires `jq` on the host.
+to emit logs to stdout/stderr. The local copy rotates at 10 MiB with five
+retained files, while Compose's container log driver has the same bound. The
+task requires `jq` on the host.
 
 The CI workflow runs `task ci:checks` and a cached Buildx build for pull
 requests and pushes to `main`. The release workflow accepts Go-style `vX.Y.Z`

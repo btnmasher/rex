@@ -253,7 +253,8 @@ for hosts that require it.
 `task docker:logs` follows the container stream, colorizes the Compose prefix
 and JSON syntax for the terminal, and appends a raw local copy to
 `.logs/rex.log`. It follows only new entries rather than replaying retained
-container history, and requires `jq` on the host.
+container history, rotates the local copy at 10 MiB with five retained files,
+and requires `jq` on the host.
 
 For local Compose use:
 

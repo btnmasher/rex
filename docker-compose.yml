@@ -16,6 +16,11 @@ services:
       - rex-state:/data
       - ./alert-destinations.json:/etc/rex/alert-destinations.json:ro,Z
     read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 2m
