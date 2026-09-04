@@ -16,15 +16,19 @@ Important package ownership:
 
 - `cmd/rex` is the composition root. It owns process signals, startup, migration and debug modes, worker lifecycle, and shutdown ordering.
 - `internal/authnextdb` owns SQLC access to auth-next-owned PostgreSQL projections.
-- `internal/tokenexport` owns the auth-next token export HTTP boundary.
+- `internal/tokenexport` owns the auth-next token export HTTP boundary, including
+  the bounded per-corporation token-count request.
 - `internal/token` owns the in-memory corporation token pool and token rotation. It does not query databases or persist tokens.
 - `internal/esi` owns ESI transport, typed endpoints, request middleware, ETags, rate limits, and bounded upstream retries.
 - `internal/universe` owns memory-cache-first entity and location resolution with optional database and public ESI sources.
 - `internal/notifications` owns ESI notification parsing, metadata extraction, classification, canonical alert paths, and safe text handling.
-- `internal/alerts` owns enrichment orchestration, destination routing, Discord message rendering, and history recording.
+- `internal/routing` owns canonical destination policy, two-phase filtering, and duplicate target validation.
+- `internal/enrichment` owns provider-neutral notification data hydration.
+- `internal/alerts` owns Discord message rendering, transport adaptation, and history recording.
+- `internal/delivery` owns durable admission, asynchronous dispatch, retries, and terminal cleanup.
 - `internal/discord` owns the provider-neutral message model and Discord webhook transport.
 - `internal/notificationstate` owns cursor, deduplication, pending delivery, and alert-history contracts.
-- `internal/poller` owns corporation scheduling, cursor advancement, global notification deduplication, and bounded delivery retry coordination.
+- `internal/poller` owns corporation scheduling, cursor advancement, global notification deduplication, and durable delivery admission.
 
 The `gen/` directories contain SQLC output. Change the owning schema, query, or
 SQLC configuration file and regenerate with `task generate`; never edit generated
@@ -42,11 +46,12 @@ flowchart TD
     F --> G[Start refresh scheduler]
     F --> H[Wait for usable token readiness]
     H --> I[Start notification poller]
-    I --> J[Fetch, classify, enrich, route, and deliver]
+    I --> J[Fetch, classify, pre-route, and enqueue]
     G --> K[Refresh corporations every 15 minutes]
-    J --> L[Persist cursors, seen IDs, retries, and history]
-    A --> M[Cancel workers and wait for shutdown]
-    M --> N[Close stores and database pool]
+    J --> L[Delivery worker enriches, post-routes, and dispatches]
+    L --> M[Persist cursors, seen IDs, retries, and history]
+    A --> N[Cancel workers and wait for shutdown]
+    N --> O[Close stores and database pool]
 ```
 
 The application runs as one process. Startup creates required dependencies
@@ -55,22 +60,95 @@ are joined before shared resources close. Startup migrations use a
 cancellation-independent context so an in-progress migration can finish its
 transaction before shutdown proceeds.
 
+The auth-next corporation export requests the count configured by
+`AUTH_NEXT_TOKEN_EXPORT_COUNT` (default `60`, maximum `64`). The client validates
+the setting and independently bounds accepted response groups to the same
+maximum.
+
+The notification pipeline is split from startup and lifecycle orchestration:
+
+```mermaid
+flowchart LR
+    A[ESI poller] --> B[Fetch and validate notifications]
+    B --> C[Classify canonical alert leaf]
+    C --> D[Pre-route]
+    D -->|No matching targets| E[Mark seen and advance cursor]
+    D -->|Matching targets| F[Atomic queue admission]
+    F --> G[(Notification state SQLite)]
+    G --> H[Delivery worker]
+    H --> I[Enrich provider-neutral alert context]
+    I --> J[Post-route]
+    J -->|No surviving targets| K[Drop queued alert]
+    J -->|Surviving targets| L[Destination adapter]
+    L --> M[Render and send provider payload]
+    M -->|Accepted| N[Record success history]
+    M -->|Retryable| O[Reschedule failed targets]
+    O --> H
+    M -->|Permanent or stale| P[Record failed history]
+    N --> Q[Remove queue row]
+    P --> Q
+    K --> Q
+    Q --> G
+```
+
+The poller only fetches, validates, classifies, pre-routes, and atomically
+persists the notification with its cursor update. It never waits for
+enrichment, provider rate limits, or delivery retries. The delivery worker
+drains the durable queue independently.
+
+Routing is applied in two stages:
+
+1. **Pre-route:** Uses the polling corporation ID and canonical alert leaf.
+   Parent selectors expand to leaves, while excluded leaves take precedence.
+   This stage is cheap and runs before queue admission.
+2. **Post-route:** Runs after shared enrichment and applies filters requiring
+   hydrated data, currently structure-type exclusions and other enriched
+   predicates. It operates only on targets persisted by pre-routing.
+
+The queue stores opaque destination target IDs, not provider URLs or rendered
+payloads. Destination adapters own provider-specific presentation and
+transport failure classification. The generic delivery worker handles success,
+retry, stale-drop, and terminal history behavior.
+
+Destination configuration is provider-aware without coupling shared routing to
+Discord:
+
+```mermaid
+flowchart LR
+    A[Versioned destination config] --> B[Shared filters and presentation]
+    A --> C[Provider delivery config]
+    B --> D[Routing policy]
+    C --> E[Provider adapter]
+    D --> F[Selected target]
+    E --> F
+    F --> G[Provider payload]
+```
+
+The current provider is Discord. Its targets, sender settings, mention rules,
+and webhook payload stay inside the Discord adapter boundary. Future providers
+can add their own delivery fields without changing shared filters or the
+generic delivery worker.
+
 ## Notification Processing
 
-The poller evaluates corporations every minute. Empty token pools are not
-queued. Token pools with ten or more usable identities may poll each cycle;
-smaller pools receive smoothed cadence. Normal notification polling does not
-reuse an identity within ten minutes.
+The poller performs an initial evaluation immediately, then evaluates
+corporations on wall-clock minute boundaries. Empty token pools are not queued.
+Token pools are capped at 64 identities per corporation. The number of
+identities required to poll each cycle is derived from the ten-minute identity
+cooldown and configured poll interval; smaller pools receive smoothed cadence.
+Normal notification polling does not reuse an identity within ten minutes. The
+access-token refresh scheduler uses
+wall-clock quarter-hour boundaries.
 
 For each character stream, the poller:
 
 1. Selects a usable corporation token and fetches the notification list from ESI.
 2. Ignores `is_read`; cursor state and the global notification-ID ledger are authoritative.
 3. Sorts eligible rows by notification timestamp and applies the hard ten-minute lookbehind.
-4. Marks stale rows and delivery candidates in durable state without advancing past unresolved failures.
+4. Marks stale rows and durably admits delivery candidates without advancing past persistence failures.
 5. Classifies known notification types into canonical dot-path alert leaves.
-6. Resolves matching destinations, enriches the event, renders Discord payloads, and delivers them.
-7. Records successful history and queues only failed destinations for bounded retry.
+6. Pre-routes matching targets without external enrichment and enqueues them atomically with the cursor.
+7. The independent delivery worker enriches, post-routes, renders, sends, and retries without blocking polling.
 
 Notification IDs are globally deduplicated. A notification is claimed once,
 even if it appears in multiple corporation streams. A pending delivery stores
@@ -83,7 +161,7 @@ The cursor rules are intentionally conservative:
 - New streams use the same window rather than replaying the entire first ESI response.
 - Future upstream timestamps are clamped to current UTC before cursor storage.
 - Rows marked stale are considered handled and advance the character cursor.
-- Cursor persistence or delivery failure stops processing before later rows can be skipped.
+- Cursor or queue-admission failure stops processing before later rows can be skipped; delivery failures remain owned by the queue worker.
 
 ## Alert Taxonomy And Routing
 
@@ -98,14 +176,16 @@ Routing is evaluated in this order:
 1. Match the polling corporation against the destination's corporation filter.
 2. Match the classified leaf against the destination's compiled selectors.
 3. Apply the destination's excluded leaf paths.
-4. Apply excluded structure type IDs using payload type data first and enriched structure data second.
-5. Expand each matching destination into webhook targets.
-6. Flatten duplicate webhook URLs so one notification produces at most one delivery per URL.
+4. Expand each matching destination into opaque delivery targets.
+5. Apply excluded structure type IDs using payload type data first and enriched structure data second.
+6. Flatten duplicate webhook URLs after post-routing filters so one notification produces at most one delivery per surviving URL. Pre-routing does not flatten URLs because shared URLs may have different post-routing filters.
 
-The first matching target wins when the same URL appears in multiple matching
+The first surviving target wins when the same URL appears in multiple matching
 destinations. Its target ID is retained for retry and alert-history records.
-Corporation filters use the polling corporation ID in `DeliveryRequest`, not a
-payload owner corporation. An empty include list means all corporations; a
+Duplicate opaque target IDs are rejected during configuration compilation.
+Corporation filters use the polling corporation ID in the queued alert
+envelope, not a payload owner corporation. An empty include list means all
+corporations; a
 non-empty include list limits delivery to those IDs. Exclusions always win,
 including when an ID appears in both lists.
 Semantic embed colors are static in `internal/alerts`; destination configuration
@@ -177,16 +257,20 @@ run `task generate`, inspect generated changes, then run `task verify`.
 
 ## Delivery And Recovery
 
-Discord delivery is bounded and context-aware. Discord `429` responses use the
-reported retry delay, with a 30-minute safety cap. Other transient upstream
-failures use bounded exponential retry. Retry records are durable and are
-dropped after 30 minutes from first queue insertion because stale alerts are
-not useful as real-time notifications.
+Discord delivery is bounded and context-aware. Each webhook call makes one
+HTTP request; `429` and server errors return a retryable result instead of
+sleeping in a polling worker. The durable pending queue applies bounded
+exponential retry, honors Discord's reported delay up to the 30-minute safety
+cap, and drops stale alerts after 30 minutes. A bounded per-webhook gate
+serializes requests and suppresses requests during an active rate-limit
+cooldown.
 
-Alert history is recorded only after Discord accepts a message and is retained
-for 30 days. It contains the raw notification, classified event, and exact
-Discord payload, but never webhook URLs or access tokens. History is pruned at
-startup and after new insertions.
+Alert history records one outcome per destination and is retained for 30 days.
+It contains the raw notification, classified event, exact Discord payload, and
+terminal delivery error when applicable, but never webhook URLs or access
+tokens. Successful deliveries are recorded immediately; transient failures
+remain in the retry queue and failed history is recorded only when retry is
+exhausted or becomes stale. History is pruned at startup and after insertions.
 
 The generic job runtime isolates failures at two levels:
 
@@ -210,9 +294,11 @@ operation, and worker handoff. New goroutines must have a clear owner, a
 shutdown signal, and a wait path. The application waits for both workers before
 closing the database or stores.
 
-Per-corporation token refreshes use keyed serialization. A canceled waiter must
-release its registry reference, and an idle keyed lock must be removed so lock
-state cannot grow without bound.
+Per-corporation token rotation uses keyed serialization. Refresh requests are
+coalesced per corporation, fetch auth-next data without holding that rotation
+lock, and publish the complete replacement snapshot under the provider mutex.
+A canceled rotation waiter must release its registry reference, and an idle
+keyed lock must be removed so lock state cannot grow without bound.
 
 ## Development Commands
 
@@ -225,6 +311,7 @@ task verify
 task ci:checks
 task test:race
 task build
+task docker:build:up:detach
 task run:debug:race
 task debug:discord
 ```
@@ -267,7 +354,7 @@ the only workflow with `packages: write` permission.
 
 ## Security Checklist
 
-- Keep `.env` and `alert-destinations.json` untracked.
+- Keep `.env` and the configured JSON/YAML destination file untracked.
 - Never log auth-next bearer credentials, access tokens, or webhook URLs.
 - Keep payload logging disabled unless actively troubleshooting.
 - Keep SQLite state on persistent storage in deployments.

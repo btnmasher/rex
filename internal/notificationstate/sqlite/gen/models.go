@@ -14,6 +14,8 @@ type AlertHistory struct {
 	CorporationTicker   string `json:"corporation_ticker"`
 	CharacterID         string `json:"character_id"`
 	DestinationID       string `json:"destination_id"`
+	DeliveryStatus      string `json:"delivery_status"`
+	DeliveryError       string `json:"delivery_error"`
 	DispatchedAt        int64  `json:"dispatched_at"`
 	RawNotificationJson []byte `json:"raw_notification_json"`
 	ClassifiedEventJson []byte `json:"classified_event_json"`
@@ -27,18 +29,20 @@ type NotificationCursor struct {
 }
 
 type NotificationRetry struct {
-	NotificationID           int64  `json:"notification_id"`
-	CorporationID            string `json:"corporation_id"`
-	CorporationName          string `json:"corporation_name"`
-	CorporationTicker        string `json:"corporation_ticker"`
-	CharacterID              string `json:"character_id"`
-	NotificationJson         []byte `json:"notification_json"`
-	FailedDestinationIdsJson []byte `json:"failed_destination_ids_json"`
-	Attempts                 int64  `json:"attempts"`
-	CreatedAt                int64  `json:"created_at"`
-	NextRetryAt              int64  `json:"next_retry_at"`
-	LastError                string `json:"last_error"`
-	UpdatedAt                int64  `json:"updated_at"`
+	NotificationID              int64  `json:"notification_id"`
+	CorporationID               string `json:"corporation_id"`
+	CorporationName             string `json:"corporation_name"`
+	CorporationTicker           string `json:"corporation_ticker"`
+	CharacterID                 string `json:"character_id"`
+	NotificationJson            []byte `json:"notification_json"`
+	DestinationIdsJson          []byte `json:"destination_ids_json"`
+	DeliveredDestinationIdsJson []byte `json:"delivered_destination_ids_json"`
+	FailedDestinationIdsJson    []byte `json:"failed_destination_ids_json"`
+	Attempts                    int64  `json:"attempts"`
+	CreatedAt                   int64  `json:"created_at"`
+	NextRetryAt                 int64  `json:"next_retry_at"`
+	LastError                   string `json:"last_error"`
+	UpdatedAt                   int64  `json:"updated_at"`
 }
 
 type NotificationSeen struct {

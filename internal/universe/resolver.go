@@ -94,6 +94,12 @@ func NewResolverWithLogger(database Database, esi ESI, logger *slog.Logger) Reso
 
 // ResolveAlliance resolves an alliance name locally and falls back to ESI when absent.
 func (r *resolver) ResolveAlliance(ctx context.Context, id string) (Entity, error) {
+	if err := requireContext(ctx); err != nil {
+		return Entity{}, err
+	}
+	if r == nil {
+		return Entity{}, errors.New("universe resolver is unavailable")
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return Entity{}, nil
@@ -139,6 +145,12 @@ func (r *resolver) ResolveRegion(ctx context.Context, id string) (Entity, error)
 
 // ResolveSolarSystem resolves a system and region, merging local and ESI data.
 func (r *resolver) ResolveSolarSystem(ctx context.Context, id string) (SolarSystem, error) {
+	if err := requireContext(ctx); err != nil {
+		return SolarSystem{}, err
+	}
+	if r == nil {
+		return SolarSystem{}, errors.New("universe resolver is unavailable")
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return SolarSystem{}, nil
@@ -159,13 +171,13 @@ func (r *resolver) ResolveSolarSystem(ctx context.Context, id string) (SolarSyst
 		return local, nil
 	}
 	remote, err := r.resolveSolarSystemFromESI(ctx, id)
+	mergeSolarSystem(&local, &remote)
 	if err != nil {
 		if databaseErr != nil {
 			return local, errors.Join(databaseErr, err)
 		}
 		return local, err
 	}
-	mergeSolarSystem(&local, &remote)
 	if local.Name != "" && local.RegionName != "" {
 		r.cacheSystem(&local)
 	}
@@ -194,6 +206,12 @@ func (r *resolver) ResolveMoon(ctx context.Context, id string) (Entity, error) {
 }
 
 func (r *resolver) resolveNamedEntity(ctx context.Context, kind, id string, resolveESI func() (Entity, error)) (Entity, error) {
+	if err := requireContext(ctx); err != nil {
+		return Entity{}, err
+	}
+	if r == nil {
+		return Entity{}, errors.New("universe resolver is unavailable")
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return Entity{}, nil
@@ -232,6 +250,13 @@ func (r *resolver) resolveNamedEntity(ctx context.Context, kind, id string, reso
 		r.cacheEntity(kind, entity)
 	}
 	return entity, err
+}
+
+func requireContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("universe resolver context is required")
+	}
+	return nil
 }
 
 func (r *resolver) resolveDatabaseEntity(ctx context.Context, kind, id string) (Entity, bool, error) {
@@ -361,7 +386,7 @@ func (r *resolver) resolveSolarSystemFromESI(ctx context.Context, id string) (So
 	remote, err := r.esi.ResolveSolarSystem(ctx, id)
 	if err != nil {
 		r.logLookup("solar_system", id, "esi", "error", err)
-		return SolarSystem{}, err
+		return remote, err
 	}
 	r.logLookup("solar_system", id, "esi", "hit", nil)
 	return remote, nil

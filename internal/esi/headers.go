@@ -215,6 +215,9 @@ func NewMemoryRateLimitStore() RateLimitStore {
 }
 
 func (s *memoryRateLimitStore) Wait(ctx context.Context, routeKey, userKey string) error {
+	if ctx == nil {
+		return errors.New("ESI rate-limit context is required")
+	}
 	if s == nil || routeKey == "" || userKey == "" {
 		return nil
 	}

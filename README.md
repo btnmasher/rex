@@ -48,13 +48,11 @@ Common optional settings:
 | --- | --- | --- |
 | `ESI_BASE_URL` | `https://esi.evetech.net` | ESI endpoint. |
 | `ESI_COMPATIBILITY_DATE` | `2026-05-19` | ESI compatibility date. |
-| `POLL_INTERVAL` | `1m` | Corporation scheduler interval. |
+| `POLL_INTERVAL` | `1m` | Wall-clock-aligned corporation scheduler interval after the initial startup poll. |
 | `POLL_LOOKBEHIND` | `10m` | Maximum age of a notification considered for delivery. Capped at 10 minutes. |
 | `HTTP_TIMEOUT` | `20s` | ESI and auth-next HTTP timeout. |
-| `ALERT_DESTINATIONS_FILE` | `alert-destinations.json` | Discord destination configuration. |
-| `DISCORD_OVERRIDE_SENDER_NAME` | `Rex Alerts` | Optional Discord username override. |
-| `DISCORD_OVERRIDE_SENDER_AVATAR_URL` | empty | Optional Discord avatar override. |
-| `DISCORD_SHOW_ENTITY_IDS` | `false` | Show hydrated IDs in parentheses; unresolved IDs remain visible as link fallbacks. |
+| `AUTH_NEXT_TOKEN_EXPORT_COUNT` | `60` | Number of access tokens requested per corporation, from `1` through `64`. |
+| `ALERT_DESTINATIONS_CONFIG` | `alert-destinations.json` | Versioned JSON or YAML destination configuration. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, or `ERROR`. |
 | `LOG_PRETTY` | `false` | Use terminal-friendly logs when stderr is a TTY. |
 | `LOG_PAYLOADS` | `false` | Include bounded raw payloads in debug logs after routing matches. |
@@ -63,36 +61,56 @@ Common optional settings:
 | `NOTIFICATION_STATE_SQLITE_PATH` | `rex-notification-state.sqlite` | Durable cursor, retry, deduplication, and history database. |
 
 ESI rate-limit coordination is process-local, so run one Rex instance per ESI
-client identity. Corporations with ten or more usable token identities can be
-polled on each scheduler cycle; smaller pools use smoothed cadence. A token
-identity is not reused for normal notification polling within ten minutes.
+client identity. The provider accepts up to 64 token identities per
+corporation. The number needed to poll on every scheduler cycle is derived from
+the ten-minute identity cooldown and `POLL_INTERVAL`; smaller pools use
+smoothed cadence. A token identity is not reused for normal notification
+polling within ten minutes.
 
 ## Discord Alert Routing
 
-`alert-destinations.json` is strict JSON; comments are not supported. Each
-destination has:
+`ALERT_DESTINATIONS_CONFIG` points to a strict version-1 JSON or YAML document.
+YAML supports comments. Each destination combines provider-neutral filters and
+presentation with a provider-specific `delivery` object:
 
 ```json
 {
-  "name": "military-alerts",
-  "webhookUrls": ["https://discord.com/api/webhooks/replace-me"],
-  "alertTypes": ["structures.combat"],
-  "excludeAlertTypes": ["structures.combat.destroyed"],
-  "excludeStructureTypeIDs": ["85230"],
-  "includeCorporationIDs": ["123456789"],
-  "excludeCorporationIDs": ["987654321"]
+  "version": 1,
+  "destinations": [
+    {
+      "name": "military-alerts",
+      "filters": {
+        "alertTypes": ["structures.combat"],
+        "excludeAlertTypes": ["structures.combat.destroyed"],
+        "excludeStructureTypeIDs": ["85230"],
+        "includeCorporationIDs": ["123456789"],
+        "excludeCorporationIDs": ["987654321"]
+      },
+      "presentation": {"showEntityIDs": false},
+      "delivery": {
+        "type": "discord",
+        "targets": [
+          {"id": "primary", "webhookUrl": "https://discord.com/api/webhooks/replace-me"}
+        ],
+        "mentionRules": [
+          {"alertTypes": ["structures.combat"], "mention": "here"}
+        ]
+      }
+    }
+  ]
 }
 ```
 
 - `name` must be unique and is used in retry and history records.
-- `webhookUrls` accepts one or more Discord webhook URLs.
-- `alertTypes` accepts canonical groups or individual leaf paths.
-- `excludeAlertTypes` accepts leaf paths only and overrides all inclusions.
-- `excludeStructureTypeIDs` suppresses matching EVE structure types. Missing type data fails open.
-- `includeCorporationIDs` limits delivery to alerts polled through the listed corporations.
-- `excludeCorporationIDs` suppresses delivery for the listed polling corporations.
+- `filters.alertTypes` accepts canonical groups or individual leaf paths.
+- `filters.excludeAlertTypes` accepts leaf paths only and overrides all inclusions.
+- `filters.excludeStructureTypeIDs` suppresses matching EVE structure types. Missing type data fails open.
+- `filters.includeCorporationIDs` limits delivery to alerts polled through the listed corporations.
+- `filters.excludeCorporationIDs` suppresses delivery for the listed polling corporations.
 - With neither corporation list, all corporations are accepted; with only one list, it acts as the allowlist or blocklist. When both are set, exclusions take precedence.
-- Duplicate webhook URLs across destinations are flattened, so one alert is sent at most once per URL.
+- Discord `delivery.targets` requires stable per-destination target IDs. Duplicate webhook URLs across destinations are flattened, so one alert is sent at most once per URL.
+- Discord `delivery.mentionRules` accepts `none`, `here`, or `everyone`; the most-specific matching selector wins and the default is no mention.
+- Discord sender name and avatar overrides, when needed, are configured under the Discord `delivery` object. `presentation.showEntityIDs` controls entity ID display for that destination.
 - `all` or `*` includes every leaf and must be the only included selector.
 - Alert selectors are case-insensitive; groups may use either `group` or `group.*`.
 
@@ -181,16 +199,18 @@ persistent storage. Docker Compose mounts both SQLite databases at `/data` and
 sets the job-store path there automatically. For a PostgreSQL job store, set
 `JOB_STORE=postgres` and provide the same `DATABASE_URL` used by auth-next.
 
-Successfully dispatched alerts are retained in `alert_history` for 30 days.
-Each row stores the raw notification, classified event, and exact Discord
-payload, but never webhook URLs or access tokens. Failed Discord deliveries
-are retried durably for at most 30 minutes; stale retry records are then
-dropped. Recent history can be inspected with:
+Terminal alert outcomes are retained in `alert_history` for 30 days. Each row
+stores the delivery status, terminal error when applicable, raw notification,
+classified event, and exact Discord payload, but never webhook URLs or access
+tokens. Failed Discord deliveries are retried durably for at most 30 minutes;
+stale or exhausted retry records are then dropped and recorded as failed
+outcomes. Recent history can be inspected with:
 
 ```sql
 select datetime(dispatched_at, 'unixepoch') as dispatched_at,
        notification_id, notification_type, alert_type,
        corporation_name, character_id, destination_id,
+       delivery_status, delivery_error,
        raw_notification_json, classified_event_json, discord_payload_json
 from alert_history
 order by dispatched_at desc, id desc
@@ -210,6 +230,7 @@ task run:debug:race    # Race detector, pretty logs, payload logging.
 task debug:discord     # Send synthetic alerts to configured destinations.
 task docker:build      # Build the Docker image.
 task docker:up:detach  # Start Docker Compose in the background.
+task docker:build:up:detach # Build the image and start Docker Compose.
 ```
 
 `task debug:discord` invokes `rex --discord-debug`, sends one synthetic event

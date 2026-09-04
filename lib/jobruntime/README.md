@@ -26,6 +26,23 @@ The runner does not assume where work comes from or what processing an item
 means. Those decisions belong to the job's optional producer, item type, codec,
 and step delegates.
 
+## Scheduling
+
+The `scheduler` package provides a small wall-clock-aligned loop for recurring
+jobs that should not overlap:
+
+```go
+err := scheduler.Run(ctx, time.Minute, func(ctx context.Context) {
+	refresh(ctx)
+})
+```
+
+The callback runs at the next interval boundary and then at subsequent
+boundaries. If a callback runs past a boundary, that boundary is skipped rather
+than replayed or run concurrently. Cancellation is controlled by the caller's
+context. Startup work can be performed separately before calling `Run` when an
+immediate first execution is required.
+
 Panic resilience is part of the runner boundary. A panic from a claimed item
 workflow is logged with its job/item context and converted into the normal
 bounded retry path. A panic in production, claiming, persistence, or other run
@@ -360,6 +377,7 @@ items:
 - `jobstore/memory`: process-local implementation.
 - `jobstore/sqlite`: SQLC-backed single-process durable implementation using a CGO-free SQLite driver.
 - `jobstore/postgres`: SQLC-backed durable implementation.
+- `scheduler`: wall-clock-aligned, non-overlapping periodic scheduling.
 
 The runner depends only on `jobstore.Store` and the optional `Producer`. Domain
 packages depend on runner interfaces, not on PostgreSQL implementation details.
@@ -378,7 +396,7 @@ go test -race ./...
 
 The generated SQLC clients are committed with the module. When changing a
 `schema.sql`, `queries.sql`, or SQLC configuration file, regenerate the affected
-client with the repository's pinned SQLC version before running these checks.
+client with a compatible SQLC version before running these checks.
 
 For a consumer, the module can be verified without the Rex service or its
 build tooling:

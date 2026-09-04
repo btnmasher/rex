@@ -10,13 +10,19 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 func TestNewClientRejectsMalformedBaseURLWithoutPanicking(t *testing.T) {
-	if _, err := NewClient("%", "secret", nil); err == nil {
+	if _, err := NewClient(ClientConfig{BaseURL: "%", BearerToken: "secret", TokenCount: 60}); err == nil {
 		t.Fatal("expected malformed base URL to fail")
+	}
+}
+
+func TestNewClientRejectsInvalidTokenCount(t *testing.T) {
+	for _, count := range []int{0, MaxTokensPerCorporation + 1} {
+		if _, err := NewClient(ClientConfig{BaseURL: "http://localhost:3000", BearerToken: "secret", TokenCount: count}); err == nil {
+			t.Fatalf("count %d unexpectedly succeeded", count)
+		}
 	}
 }
 
@@ -25,7 +31,12 @@ func TestClientListsCorporationsAndFetchesScopedExports(t *testing.T) {
 	server := newExportServer(t, bearer)
 	defer server.Close()
 
-	client, err := NewClient(server.URL+"/auth", bearer, server.Client())
+	client, err := NewClient(ClientConfig{
+		BaseURL:     server.URL + "/auth",
+		BearerToken: bearer,
+		TokenCount:  60,
+		HTTPClient:  server.Client(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,17 +64,17 @@ func newExportServer(t *testing.T, bearer string) *httptest.Server {
 			if corporationID == "" {
 				corporationID = "100"
 			}
+			if request.URL.Query().Get("count") != "60" {
+				t.Errorf("count = %q, want 60", request.URL.Query().Get("count"))
+			}
 			writeJSON(t, writer, Response{
 				Corporations: []CorporationTokenGroup{{
 					CorporationID:   corporationID,
 					CorporationName: "Corp",
 					Tokens: []AccessTokenRecord{{
-						CharacterID:   "900000001",
-						CharacterName: "Pilot",
-						UserID:        uuid.MustParse("00000000-0000-0000-0000-000000000001"),
-						Role:          "member",
-						AccessToken:   "access",
-						ExpiresAt:     time.Now().Add(time.Hour),
+						CharacterID: "900000001",
+						AccessToken: "access",
+						ExpiresAt:   time.Now().Add(time.Hour),
 					}},
 				}},
 			})
@@ -84,15 +95,12 @@ func writeJSON(t *testing.T, writer http.ResponseWriter, value any) {
 func TestClientRejectsInvalidAndOversizedResponses(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		tokens := make([]AccessTokenRecord, 0, maxTokensPerCorp+1)
-		for i := range maxTokensPerCorp + 1 {
+		tokens := make([]AccessTokenRecord, 0, MaxTokensPerCorporation+1)
+		for i := range MaxTokensPerCorporation + 1 {
 			tokens = append(tokens, AccessTokenRecord{
-				CharacterID:   strconv.Itoa(i + 1),
-				CharacterName: "Pilot " + strconv.Itoa(i+1),
-				UserID:        uuid.MustParse("00000000-0000-0000-0000-000000000001"),
-				Role:          "member",
-				AccessToken:   "access",
-				ExpiresAt:     time.Now().Add(time.Hour),
+				CharacterID: strconv.Itoa(i + 1),
+				AccessToken: "access",
+				ExpiresAt:   time.Now().Add(time.Hour),
 			})
 		}
 		response := Response{Corporations: []CorporationTokenGroup{{CorporationID: "100", CorporationName: "Corp", Tokens: tokens}}}
@@ -101,7 +109,12 @@ func TestClientRejectsInvalidAndOversizedResponses(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL, "secret", server.Client())
+	client, err := NewClient(ClientConfig{
+		BaseURL:     server.URL,
+		BearerToken: "secret",
+		TokenCount:  60,
+		HTTPClient:  server.Client(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +131,12 @@ func TestClientClassifiesUnauthorizedWithoutLeakingBearer(t *testing.T) {
 		writer.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer server.Close()
-	client, err := NewClient(server.URL, "super-secret", server.Client())
+	client, err := NewClient(ClientConfig{
+		BaseURL:     server.URL,
+		BearerToken: "super-secret",
+		TokenCount:  60,
+		HTTPClient:  server.Client(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

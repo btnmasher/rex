@@ -74,7 +74,11 @@ func TestStorePersistsPendingNotificationAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
-	claimed, err := store.ClaimPending(context.Background(), &pending)
+	claimed, err := store.Admit(context.Background(), &notificationstate.Admission{
+		NotificationID: pending.NotificationID,
+		CorporationID:  pending.CorporationID,
+		Pending:        &pending,
+	})
 	if err != nil || !claimed {
 		t.Fatalf("claim pending: claimed=%v err=%v", claimed, err)
 	}
@@ -110,11 +114,12 @@ func TestStoreDropsMalformedPendingNotificationWhenListing(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `
 		insert into notification_retries (
 		  notification_id, corporation_id, corporation_name, corporation_ticker,
-		  character_id, notification_json, failed_destination_ids_json,
-		  attempts, next_retry_at, last_error, created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`,
+		  character_id, notification_json, destination_ids_json,
+		  failed_destination_ids_json, attempts, next_retry_at, last_error,
+		  created_at, updated_at
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`,
 		901, "100", "Corp", "CORP", "900000001", []byte(`{"notification_id":901}`),
-		[]byte(`not-json`), 0, time.Now().UTC().Add(-time.Second).Unix(), "malformed", time.Now().UTC().Unix()); err != nil {
+		[]byte(`[]`), []byte(`not-json`), 0, time.Now().UTC().Add(-time.Second).Unix(), "malformed", time.Now().UTC().Unix()); err != nil {
 		t.Fatalf("insert malformed pending notification: %v", err)
 	}
 	items, err := store.ListPending(ctx, 10, time.Now().UTC())
@@ -146,11 +151,11 @@ func TestStorePrunesAlertHistoryAfterInsertion(t *testing.T) {
 		insert into alert_history (
 		  notification_id, notification_type, alert_type, corporation_id,
 		  corporation_name, corporation_ticker, character_id, destination_id,
-		  dispatched_at, raw_notification_json, classified_event_json,
-		  discord_payload_json
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  delivery_status, delivery_error, dispatched_at, raw_notification_json,
+		  classified_event_json, discord_payload_json
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		902, "StructureDestroyed", notificationstateAlertType, "100", "Corp", "CORP", "900000001", "structure-alerts",
-		old.Unix(), []byte(`{}`), []byte(`{}`), []byte(`{}`)); err != nil {
+		notificationstate.AlertDeliveryStatusDelivered, "", old.Unix(), []byte(`{}`), []byte(`{}`), []byte(`{}`)); err != nil {
 		t.Fatalf("insert old alert history: %v", err)
 	}
 	if err := store.RecordAlert(ctx, &notificationstate.AlertHistoryRecord{
@@ -162,6 +167,7 @@ func TestStorePrunesAlertHistoryAfterInsertion(t *testing.T) {
 		CorporationTicker:   "CORP",
 		CharacterID:         "900000001",
 		DestinationID:       "structure-alerts",
+		DeliveryStatus:      notificationstate.AlertDeliveryStatusDelivered,
 		DispatchedAt:        time.Now().UTC(),
 		RawNotificationJSON: []byte(`{"notification_id":903}`),
 		ClassifiedEventJSON: []byte(`{"notification_id":903}`),
@@ -230,6 +236,7 @@ func TestStorePersistsAlertHistoryAndPrunesItOnReopen(t *testing.T) {
 		CorporationTicker:   "CORP",
 		CharacterID:         "900000001",
 		DestinationID:       "structure-alerts",
+		DeliveryStatus:      notificationstate.AlertDeliveryStatusDelivered,
 		DispatchedAt:        time.Now().UTC(),
 		RawNotificationJSON: []byte(`{"notification_id":789,"text":"raw"}`),
 		ClassifiedEventJSON: []byte(`{"notification_id":789,"alert_type":"structures.combat.under_attack"}`),
@@ -243,6 +250,7 @@ func TestStorePersistsAlertHistoryAndPrunesItOnReopen(t *testing.T) {
 		t.Fatalf("list alert history: records=%v err=%v", got, err)
 	}
 	if got[0].NotificationID != want.NotificationID || got[0].DestinationID != want.DestinationID ||
+		got[0].DeliveryStatus != want.DeliveryStatus || got[0].DeliveryError != want.DeliveryError ||
 		!bytes.Equal(got[0].RawNotificationJSON, want.RawNotificationJSON) ||
 		!bytes.Equal(got[0].DiscordPayloadJSON, want.DiscordPayloadJSON) {
 		t.Fatalf("unexpected alert history record: %+v", got[0])
@@ -252,11 +260,11 @@ func TestStorePersistsAlertHistoryAndPrunesItOnReopen(t *testing.T) {
 		insert into alert_history (
 		  notification_id, notification_type, alert_type, corporation_id,
 		  corporation_name, corporation_ticker, character_id, destination_id,
-		  dispatched_at, raw_notification_json, classified_event_json,
-		  discord_payload_json
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  delivery_status, delivery_error, dispatched_at, raw_notification_json,
+		  classified_event_json, discord_payload_json
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		800, "StructureDestroyed", notificationstateAlertType, "100", "Corp", "CORP", "900000001", "structure-alerts",
-		old.Unix(), []byte(`{}`), []byte(`{}`), []byte(`{}`)); err != nil {
+		notificationstate.AlertDeliveryStatusDelivered, "", old.Unix(), []byte(`{}`), []byte(`{}`), []byte(`{}`)); err != nil {
 		t.Fatalf("insert old alert history: %v", err)
 	}
 	if err := store.Close(); err != nil {

@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/btnmasher/rex/internal/tokenexport"
 )
 
@@ -50,7 +48,7 @@ func (s *exportSource) FetchCorporation(ctx context.Context, _ string) (tokenexp
 
 func TestProviderLoadsSnapshotAndRoundRobinsAccessTokens(t *testing.T) {
 	source := &exportSource{}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +72,7 @@ func TestProviderLoadsSnapshotAndRoundRobinsAccessTokens(t *testing.T) {
 }
 
 func TestProviderReportsConfiguredTokenAvailability(t *testing.T) {
-	provider, err := NewProvider(&exportSource{})
+	provider, err := NewProvider(&exportSource{}, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +98,7 @@ func TestProviderReportsConfiguredTokenAvailability(t *testing.T) {
 
 func TestProviderSerializesCorporationRotation(t *testing.T) {
 	source := &exportSource{}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +132,7 @@ func TestProviderSerializesCorporationRotation(t *testing.T) {
 
 func TestProviderDoesNotReuseNotificationTokenDuringCooldown(t *testing.T) {
 	source := &exportSource{}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +167,7 @@ func TestProviderDoesNotReuseNotificationTokenDuringCooldown(t *testing.T) {
 }
 
 func TestProviderReportsWhenAllTokenIdentitiesAreCoolingDown(t *testing.T) {
-	provider, err := NewProvider(&exportSource{})
+	provider, err := NewProvider(&exportSource{}, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +198,7 @@ func TestProviderReportsWhenAllTokenIdentitiesAreCoolingDown(t *testing.T) {
 }
 
 func TestProviderDoesNotSmoothCorporationsWithTenOrMoreTokens(t *testing.T) {
-	provider, err := NewProvider(&exportSource{})
+	provider, err := NewProvider(&exportSource{}, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,9 +217,44 @@ func TestProviderDoesNotSmoothCorporationsWithTenOrMoreTokens(t *testing.T) {
 	}
 }
 
+func TestProviderDerivesSmoothingThresholdFromPollInterval(t *testing.T) {
+	provider, err := NewProvider(&exportSource{}, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := make([]string, 0, 19)
+	for index := range 19 {
+		tokens = append(tokens, fmt.Sprintf("%d", index+1))
+	}
+	if err := provider.InstallCorporation(context.Background(), testGroup(tokens...)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.NextAccessToken(context.Background(), "100"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.NextAccessToken(context.Background(), "100"); !errors.Is(err, ErrNotificationCooldown) {
+		t.Fatalf("expected polling cadence cooldown with 19 tokens at 30 seconds, got %v", err)
+	}
+
+	provider, err = NewProvider(&exportSource{}, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens = append(tokens, "20")
+	if err := provider.InstallCorporation(context.Background(), testGroup(tokens...)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.NextAccessToken(context.Background(), "100"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.NextAccessToken(context.Background(), "100"); err != nil {
+		t.Fatalf("expected every 30-second cycle to proceed with 20 tokens: %v", err)
+	}
+}
+
 func TestProviderPreservesExistingTokenCooldownAcrossFullRefresh(t *testing.T) {
 	source := &exportSource{}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +281,7 @@ func TestProviderRefreshesAccessTokenWithScopedExport(t *testing.T) {
 	source := &exportSource{
 		scoped: tokenexport.Response{Corporations: []tokenexport.CorporationTokenGroup{testGroup("replacement")}},
 	}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +308,7 @@ func TestProviderCoalescesConcurrentForcedRefreshes(t *testing.T) {
 		fetchStarted: make(chan struct{}),
 		fetchRelease: make(chan struct{}),
 	}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,11 +339,51 @@ func TestProviderCoalescesConcurrentForcedRefreshes(t *testing.T) {
 	}
 }
 
+func TestProviderRefreshDoesNotBlockTokenSelectionDuringFetch(t *testing.T) {
+	source := &exportSource{
+		scoped:       tokenexport.Response{Corporations: []tokenexport.CorporationTokenGroup{testGroup("replacement")}},
+		fetchStarted: make(chan struct{}),
+		fetchRelease: make(chan struct{}),
+	}
+	provider, err := NewProvider(source, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.InstallCorporation(context.Background(), testGroup("initial")); err != nil {
+		t.Fatal(err)
+	}
+	provider.notificationCooldown = 0
+	provider.minimumPollInterval = 0
+
+	refreshResult := make(chan error, 1)
+	go func() { refreshResult <- provider.RefreshCorporation(context.Background(), "100") }()
+	select {
+	case <-source.fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start")
+	}
+
+	selectionContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	credential, err := provider.NextAccessToken(selectionContext, "100")
+	if err != nil {
+		t.Fatalf("token selection during refresh: %v", err)
+	}
+	if credential.CharacterID != "initial" {
+		t.Fatalf("selected character during refresh = %s, want initial", credential.CharacterID)
+	}
+
+	close(source.fetchRelease)
+	if err := <-refreshResult; err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+}
+
 func TestProviderSkipsScheduledRefreshAfterRecentAdHocRefresh(t *testing.T) {
 	source := &exportSource{
 		scoped: tokenexport.Response{Corporations: []tokenexport.CorporationTokenGroup{testGroup("replacement")}},
 	}
-	provider, err := NewProvider(source)
+	provider, err := NewProvider(source, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +416,7 @@ func TestProviderSkipsScheduledRefreshAfterRecentAdHocRefresh(t *testing.T) {
 }
 
 func TestProviderRemovesCorporationsThatAreNoLongerEligible(t *testing.T) {
-	provider, err := NewProvider(&exportSource{})
+	provider, err := NewProvider(&exportSource{}, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,13 +486,10 @@ func TestKeyedLockerHonorsCanceledWaiters(t *testing.T) {
 
 func testGroup(characterIDs ...string) tokenexport.CorporationTokenGroup {
 	group := tokenexport.CorporationTokenGroup{CorporationID: "100", CorporationName: "Corp"}
-	for i, characterID := range characterIDs {
+	for _, characterID := range characterIDs {
 		group.Tokens = append(group.Tokens, tokenexport.AccessTokenRecord{
-			CharacterID:   characterID,
-			CharacterName: "Pilot",
-			UserID:        uuid.MustParse(fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)),
-			Role:          "member",
-			AccessToken:   "access-" + characterID,
+			CharacterID: characterID,
+			AccessToken: "access-" + characterID,
 		})
 	}
 	return group

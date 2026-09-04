@@ -243,6 +243,9 @@ func NewClient(baseURL, compatibility string, httpClient *http.Client, options .
 // DoJSON executes an endpoint request and decodes a successful JSON response.
 // A 304 response returns a zero Value with Metadata.NotModified set.
 func DoJSON[T any](ctx context.Context, c *Client, request *Request) (Response[T], error) {
+	if ctx == nil {
+		return Response[T]{}, errors.New("ESI request context is required")
+	}
 	if c == nil {
 		return Response[T]{}, errors.New("ESI client must not be nil")
 	}

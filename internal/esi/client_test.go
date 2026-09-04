@@ -20,6 +20,16 @@ func TestNewClientRejectsNonHTTPBaseURL(t *testing.T) {
 	}
 }
 
+func TestDoJSONRejectsNilContext(t *testing.T) {
+	if _, err := DoJSON[any](nilESIContext(), nil, nil); err == nil {
+		t.Fatal("expected nil context error")
+	}
+}
+
+func nilESIContext() context.Context {
+	return nil
+}
+
 func TestNotificationsRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/characters/900000001/notifications" {

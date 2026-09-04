@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/btnmasher/rex/internal/authnextdb"
+	"github.com/btnmasher/rex/internal/delivery"
 	"github.com/btnmasher/rex/internal/discord"
+	"github.com/btnmasher/rex/internal/enrichment"
 	"github.com/btnmasher/rex/internal/notifications"
 	"github.com/btnmasher/rex/internal/notificationstate"
-	"github.com/btnmasher/rex/internal/universe"
+	"github.com/btnmasher/rex/internal/routing"
 )
 
 const (
@@ -34,6 +36,8 @@ const (
 	maxActivityFields             = 4
 	maxScheduleValues             = 3
 	maxLoggedPayloadBytes         = 128 << 10
+	historyWriteAttempts          = 3
+	historyRetryDelay             = 250 * time.Millisecond
 	reinforcementWeekdayUnchanged = 255
 	discordTimestampFull          = "F"
 	discordTimestampRelative      = "R"
@@ -122,51 +126,55 @@ var eventFieldRenderers = [...]func(*eventView) []discord.Field{
 
 // Service resolves auth-next configuration and delivers notification embeds.
 type Service struct {
-	database                Database
-	delivery                discord.Delivery
-	destinations            []Destination
-	overrideSenderName      string
-	overrideSenderAvatarURL string
-	showEntityIDs           bool
-	logPayloads             bool
-	logger                  *slog.Logger
-	resolver                universe.Resolver
-	history                 notificationstate.AlertHistory
+	delivery    discord.Delivery
+	enricher    enrichment.Enricher
+	routing     *routing.Policy
+	targets     map[string]webhookTarget
+	logPayloads bool
+	logger      *slog.Logger
+	history     notificationstate.AlertHistory
 }
 
 // Destination is a named Discord destination and its canonical alert selector mapping.
 type Destination struct {
 	ID                      string
 	WebhookURLs             []string
+	WebhookTargets          []WebhookTarget
 	AlertTypes              []string
 	ExcludeAlertTypes       []string
 	ExcludeStructureTypeIDs []string
 	IncludeCorporationIDs   []string
 	ExcludeCorporationIDs   []string
-	routing                 alertRouting
-	corporations            corporationFilter
+	Presentation            Presentation
+	MentionRules            []MentionRule
+	SenderName              string
+	SenderAvatarURL         string
 }
 
-type alertRouting struct {
-	included map[string]struct{}
-	excluded map[string]struct{}
+// WebhookTarget identifies one stable Discord webhook target.
+type WebhookTarget struct {
+	ID  string
+	URL string
 }
 
-type corporationFilter struct {
-	included map[string]struct{}
-	excluded map[string]struct{}
+// Presentation controls provider-specific rendering preferences for a destination.
+type Presentation struct {
+	ShowEntityIDs bool
 }
 
-// Config controls local alert routing and optional Discord webhook identity overrides.
+// MentionRule configures an optional Discord mention for matching alert selectors.
+type MentionRule struct {
+	AlertTypes []string
+	Mention    string
+}
+
+// Config controls local alert routing and Discord delivery.
 type Config struct {
-	Destinations            []Destination
-	OverrideSenderName      string
-	OverrideSenderAvatarURL string
-	ShowEntityIDs           bool
-	LogPayloads             bool
-	Logger                  *slog.Logger
-	UniverseResolver        universe.Resolver
-	History                 notificationstate.AlertHistory
+	Destinations []Destination
+	Enricher     enrichment.Enricher
+	LogPayloads  bool
+	Logger       *slog.Logger
+	History      notificationstate.AlertHistory
 }
 
 // DeliveryRequest identifies one event and optionally limits delivery to the
@@ -206,18 +214,14 @@ type Database interface {
 	GetStructuresByIDs(context.Context, []string) ([]authnextdb.Structure, error)
 }
 
-// NameResolver optionally resolves universe names for richer alert fields.
-type NameResolver interface {
-	ResolveNames(context.Context, string, []string) (map[string]string, error)
-}
-
 // NewService creates the alert delivery service. The structure database may be
-// nil; universe enrichment remains best-effort through the configured resolver.
-func NewService(database Database, delivery discord.Delivery, config *Config) (*Service, error) {
-	if delivery == nil || config == nil {
+// nil; enrichment remains best-effort through the supplied enrichment service.
+func NewService(database Database, discordDelivery discord.Delivery, config *Config) (*Service, error) {
+	if discordDelivery == nil || config == nil {
 		return nil, errors.New("alert service dependencies are required")
 	}
-	destinations, err := cloneDestinations(config.Destinations)
+	routingDestinations, targets := compileDiscordDestinations(config.Destinations)
+	compiledRouting, err := routing.New(routingDestinations)
 	if err != nil {
 		return nil, err
 	}
@@ -225,51 +229,35 @@ func NewService(database Database, delivery discord.Delivery, config *Config) (*
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{
-		database:                database,
-		delivery:                delivery,
-		destinations:            destinations,
-		overrideSenderName:      config.OverrideSenderName,
-		overrideSenderAvatarURL: config.OverrideSenderAvatarURL,
-		showEntityIDs:           config.ShowEntityIDs,
-		logPayloads:             config.LogPayloads,
-		logger:                  logger,
-		resolver:                config.UniverseResolver,
-		history:                 config.History,
-	}, nil
-}
-
-func cloneDestinations(values []Destination) ([]Destination, error) {
-	clones := make([]Destination, len(values))
-	for i := range values {
-		clones[i] = values[i]
-		clones[i].AlertTypes = append([]string(nil), values[i].AlertTypes...)
-		clones[i].ExcludeAlertTypes = append([]string(nil), values[i].ExcludeAlertTypes...)
-		clones[i].ExcludeStructureTypeIDs = append([]string(nil), values[i].ExcludeStructureTypeIDs...)
-		clones[i].IncludeCorporationIDs = append([]string(nil), values[i].IncludeCorporationIDs...)
-		clones[i].ExcludeCorporationIDs = append([]string(nil), values[i].ExcludeCorporationIDs...)
-		clones[i].WebhookURLs = append([]string(nil), values[i].WebhookURLs...)
-		routing, err := compileAlertRouting(clones[i].AlertTypes, clones[i].ExcludeAlertTypes)
-		if err != nil {
-			return nil, fmt.Errorf("destination %q: %w", clones[i].ID, err)
-		}
-		clones[i].routing = routing
-		clones[i].corporations = compileCorporationFilter(clones[i].IncludeCorporationIDs, clones[i].ExcludeCorporationIDs)
+	enricher := config.Enricher
+	if enricher == nil {
+		enricher = enrichment.NewService(database, nil, logger)
 	}
-	return clones, nil
+	return &Service{
+		delivery:    discordDelivery,
+		enricher:    enricher,
+		routing:     compiledRouting,
+		targets:     targets,
+		logPayloads: config.LogPayloads,
+		logger:      logger,
+		history:     config.History,
+	}, nil
 }
 
 // Deliver resolves configured destinations and sends an alert event.
 func (s *Service) Deliver(ctx context.Context, request *DeliveryRequest) error {
+	if ctx == nil {
+		return errors.New("alert delivery context is required")
+	}
 	if request == nil || request.Event == nil {
 		return errors.New("alert event is required")
 	}
-	if len(s.destinations) == 0 {
+	if s == nil || s.routing == nil {
 		return nil
 	}
-	requested := requestedDestinationIDs(request)
-	matching := s.matchingDestinations(requested, request.Corporation.ID, request.Event.AlertType)
-	if len(matching) == 0 {
+	candidates := s.routing.PreRoute(request.Corporation.ID, request.Event.AlertType)
+	candidates = s.routing.Restrict(candidates, request.DestinationIDs)
+	if len(candidates) == 0 {
 		s.logger.Debug("alert has no configured destinations",
 			"notification_id", request.Event.NotificationID,
 			"alert_type", request.Event.AlertType,
@@ -280,11 +268,11 @@ func (s *Service) Deliver(ctx context.Context, request *DeliveryRequest) error {
 	if err != nil {
 		return err
 	}
-	matching = s.filterDestinations(request, view, matching)
-	if len(matching) == 0 {
+	candidates = s.routing.PostRoute(view, candidates)
+	if len(candidates) == 0 {
 		return nil
 	}
-	targets := flattenWebhookTargets(matching, requested)
+	targets := s.webhookTargets(candidates)
 	if len(targets) == 0 {
 		return nil
 	}
@@ -292,23 +280,80 @@ func (s *Service) Deliver(ctx context.Context, request *DeliveryRequest) error {
 	return s.deliverTargets(ctx, view, targets)
 }
 
-func requestedDestinationIDs(request *DeliveryRequest) map[string]struct{} {
-	requested := make(map[string]struct{}, len(request.DestinationIDs))
-	for _, destinationID := range request.DestinationIDs {
-		requested[destinationID] = struct{}{}
+// PreRoute selects candidate webhook targets using only the raw event and
+// polling corporation context. It performs no enrichment or external I/O.
+func (s *Service) PreRoute(envelope *enrichment.Envelope) []string {
+	if s == nil || s.routing == nil || envelope == nil {
+		return nil
 	}
-	return requested
+	return s.routing.PreRoute(envelope.Corporation.ID, envelope.Event.AlertType)
 }
 
-func (s *Service) matchingDestinations(requested map[string]struct{}, corporationID, alertType string) []Destination {
-	matching := make([]Destination, 0, len(s.destinations))
-	for i := range s.destinations {
-		destination := &s.destinations[i]
-		if destinationSelected(requested, destination) && destination.corporations.supports(corporationID) && destination.routing.supports(alertType) {
-			matching = append(matching, *destination)
+// PostRoute applies enrichment-dependent filters to pre-routed webhook targets.
+func (s *Service) PostRoute(view *enrichment.Context, candidateIDs []string) []string {
+	if s == nil || s.routing == nil || view == nil {
+		return nil
+	}
+	return s.uniqueWebhookTargetIDs(s.routing.PostRoute(view, candidateIDs))
+}
+
+// Deliver sends one enriched alert through the configured Discord webhook
+// target and converts provider-specific failures to a generic delivery result.
+func (s *Service) DeliverTarget(ctx context.Context, view *enrichment.Context, targetID string) delivery.Outcome {
+	if ctx == nil {
+		return delivery.Outcome{Status: delivery.OutcomePermanent, Err: errors.New("alert delivery context is required")}
+	}
+	if s == nil || view == nil {
+		return delivery.Outcome{Status: delivery.OutcomePermanent, Err: errors.New("alert target context is required")}
+	}
+	target := s.webhookTarget(targetID)
+	if target == nil {
+		return delivery.Outcome{Status: delivery.OutcomePermanent, Err: fmt.Errorf("unknown Discord target %q", targetID)}
+	}
+	if err := s.deliverTarget(ctx, target, view); err != nil {
+		var retryErr *discord.RetryableError
+		if errors.As(err, &retryErr) && retryErr != nil {
+			return delivery.Outcome{Status: delivery.OutcomeRetryable, RetryAfter: retryErr.Delay, Err: err}
+		}
+		return delivery.Outcome{Status: delivery.OutcomePermanent, Err: err}
+	}
+	return delivery.Outcome{Status: delivery.OutcomeAccepted}
+}
+
+// RecordTerminalFailure records an enriched alert that could not be delivered.
+func (s *Service) RecordTerminalFailure(ctx context.Context, view *enrichment.Context, destinationIDs []string, deliveryErr error) error {
+	if ctx == nil {
+		return errors.New("alert history context is required")
+	}
+	return s.recordFailureHistory(ctx, view, destinationIDs, deliveryErr)
+}
+
+func (s *Service) recordFailureHistory(ctx context.Context, view *eventView, destinationIDs []string, deliveryErr error) error {
+	if s == nil || s.history == nil || view == nil {
+		return nil
+	}
+	if deliveryErr == nil {
+		return errors.New("delivery failure is required")
+	}
+	errorText := truncate(deliveryErr.Error(), maxTextSize)
+	seen := make(map[string]struct{}, len(destinationIDs))
+	var errs []error
+	for _, destinationID := range destinationIDs {
+		destinationID = strings.TrimSpace(destinationID)
+		if destinationID == "" {
+			continue
+		}
+		if _, ok := seen[destinationID]; ok {
+			continue
+		}
+		seen[destinationID] = struct{}{}
+		target := s.webhookTarget(destinationID)
+		message := renderForTarget(view, target)
+		if err := s.recordHistoryOutcome(ctx, destinationID, view, &message, notificationstate.AlertDeliveryStatusFailed, errorText); err != nil {
+			errs = append(errs, fmt.Errorf("record failed alert for destination %s: %w", destinationID, err))
 		}
 	}
-	return matching
+	return errors.Join(errs...)
 }
 
 func (s *Service) deliverTargets(ctx context.Context, view *eventView, targets []webhookTarget) error {
@@ -326,488 +371,169 @@ func (s *Service) deliverTargets(ctx context.Context, view *eventView, targets [
 	return &DeliveryError{DestinationIDs: failedIDs, Err: errors.Join(errs...)}
 }
 
-func (s *Service) filterDestinations(request *DeliveryRequest, view *eventView, matching []Destination) []Destination {
-	filtered := matching[:0]
-	for i := range matching {
-		if destinationExcludesStructureType(&matching[i], view) {
-			s.logger.Debug("alert destination filtered by structure type",
-				"destination_id", matching[i].ID,
-				"notification_id", request.Event.NotificationID,
-				"structure_type_id", structureTypeID(view),
-			)
-			continue
-		}
-		filtered = append(filtered, matching[i])
-	}
-	return filtered
-}
-
 func (s *Service) buildEventView(ctx context.Context, request *DeliveryRequest) (*eventView, error) {
 	if request == nil || request.Event == nil {
 		return nil, errors.New("alert event is required")
 	}
-	event := *request.Event
-	var structures []authnextdb.Structure
-	if s.database != nil {
-		var err error
-		structures, err = s.database.GetStructuresByIDs(ctx, event.StructureIDs)
-		if err != nil {
-			s.logger.Warn("alert structure enrichment failed", "notification_id", event.NotificationID, "err", err)
-			structures = nil
-		}
+	if s == nil {
+		return nil, errors.New("alert enrichment service is unavailable")
 	}
-	s.enrichStructures(ctx, structures)
-	event.StructureTypeID = structureTypeIDForEvent(&event, structures)
-	structureTypeName := s.resolveStructureTypeName(ctx, event.StructureTypeID, structures)
-	structureTypeNames := s.resolveStructureTypeNames(ctx, structures)
-	location := s.resolveLocation(ctx, event.SystemID)
-	if event.AllianceID == "" && location.AllianceID != "" {
-		event.AllianceID = location.AllianceID
-		event.AllianceName = location.AllianceName
+	if s.enricher == nil {
+		return nil, errors.New("alert enrichment service is unavailable")
 	}
-	if event.AllianceID == "" && strings.EqualFold(event.SenderType, "alliance") && event.SenderID > 0 {
-		event.AllianceID = strconv.FormatInt(event.SenderID, 10)
-	}
-	allianceName, allianceIconURL, err := s.resolveAlliance(ctx, &event)
+	view, err := s.enricher.Enrich(ctx, &enrichment.Envelope{
+		Corporation:         request.Corporation,
+		CharacterID:         request.CharacterID,
+		RawNotificationJSON: request.RawNotificationJSON,
+		Event:               *request.Event,
+	})
 	if err != nil {
-		s.logger.Warn("alert alliance enrichment failed", "alliance_id", event.AllianceID, "err", err)
-		allianceName = event.AllianceName
-		allianceIconURL = ""
-	}
-	s.enrichAttacker(ctx, &event)
-	s.enrichActor(ctx, &event)
-	s.enrichOwnership(ctx, &event)
-	planetName := s.resolveCelestialName(ctx, "planet", event.PlanetID)
-	moonName := s.resolveCelestialName(ctx, "moon", event.MoonID)
-	s.logger.Debug("alert structures enriched",
-		"notification_id", event.NotificationID,
-		"structure_count", len(structures),
-	)
-	// The ESI owner corporation is authoritative for structure notifications.
-	// The polling corporation remains a display fallback when owner metadata or
-	// a tracked structure record is unavailable.
-	corporationOwned := len(event.StructureIDs) > 0 || event.OwnerCorporationID != "" || notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStarbase) || notifications.AlertTypeInGroup(event.AlertType, notifications.AlertCustomsOffices)
-	view := &eventView{
-		CorporationID:            request.Corporation.ID,
-		CorporationName:          request.Corporation.Name,
-		CorporationTicker:        request.Corporation.Ticker,
-		CorporationOwned:         corporationOwned,
-		SystemName:               location.Name,
-		RegionID:                 location.RegionID,
-		RegionName:               location.RegionName,
-		AllianceName:             allianceName,
-		AllianceIconURL:          allianceIconURL,
-		ShowEntityIDs:            s.showEntityIDs,
-		PlanetName:               planetName,
-		MoonName:                 moonName,
-		Event:                    event,
-		Structures:               structures,
-		CharacterID:              request.CharacterID,
-		RawNotificationJSON:      append([]byte(nil), request.RawNotificationJSON...),
-		PollingCorporationID:     request.Corporation.ID,
-		PollingCorporationName:   request.Corporation.Name,
-		PollingCorporationTicker: request.Corporation.Ticker,
-		StructureTypeName:        structureTypeName,
-		StructureTypeNames:       structureTypeNames,
-	}
-	if event.OwnerCorporationID != "" {
-		view.CorporationID = event.OwnerCorporationID
-		if event.OwnerCorporationID != request.Corporation.ID {
-			view.CorporationTicker = ""
-		}
-	}
-	if event.OwnerCorporationName != "" {
-		view.CorporationName = event.OwnerCorporationName
+		return nil, err
 	}
 	return view, nil
 }
 
-func (s *Service) resolveCelestialName(ctx context.Context, kind, id string) string {
-	if id == "" {
-		return ""
-	}
-	if s.resolver == nil {
-		return ""
-	}
-	entity, err := s.resolveCelestial(ctx, kind, id)
-	if err != nil {
-		s.logger.Warn("alert celestial enrichment failed", "kind", kind, "id", id, "err", err)
-		return ""
-	}
-	if entity.Name != "" {
-		return entity.Name
-	}
-	return ""
-}
-
-func (s *Service) resolveStructureTypeName(ctx context.Context, typeID string, structures []authnextdb.Structure) string {
-	if typeID == "" {
-		return ""
-	}
-	for index := range structures {
-		structure := &structures[index]
-		if structure.TypeID == typeID && structure.TypeName != nil && strings.TrimSpace(*structure.TypeName) != "" {
-			return strings.TrimSpace(*structure.TypeName)
-		}
-	}
-	if s.resolver != nil {
-		entity, err := s.resolver.ResolveStructureType(ctx, typeID)
-		if err != nil {
-			s.logger.Warn("alert structure type enrichment failed", "type_id", typeID, "err", err)
-			return ""
-		}
-		return entity.Name
-	}
-	name, err := s.resolveName(ctx, "type", typeID)
-	if err != nil {
-		s.logger.Warn("alert structure type enrichment failed", "type_id", typeID, "err", err)
-		return ""
-	}
-	return name
-}
-
-func (s *Service) resolveStructureTypeNames(ctx context.Context, structures []authnextdb.Structure) map[string]string {
-	names := make(map[string]string, len(structures))
-	for index := range structures {
-		typeID := strings.TrimSpace(structures[index].TypeID)
-		if typeID == "" {
-			continue
-		}
-		if _, resolved := names[typeID]; resolved {
-			continue
-		}
-		name := optionalString(structures[index].TypeName)
-		if name == "" {
-			name = s.resolveStructureTypeName(ctx, typeID, nil)
-		}
-		if name != "" {
-			names[typeID] = name
-		}
-	}
-	return names
-}
-
-func (s *Service) resolveCelestial(ctx context.Context, kind, id string) (universe.Entity, error) {
-	if s == nil || s.resolver == nil {
-		return universe.Entity{}, errors.New("universe resolver is unavailable")
-	}
-	if kind == "planet" {
-		return s.resolver.ResolvePlanet(ctx, id)
-	}
-	return s.resolver.ResolveMoon(ctx, id)
-}
-
-func (s *Service) resolveLocation(ctx context.Context, systemID string) universe.SolarSystem {
-	location := universe.SolarSystem{ID: systemID}
-	if systemID == "" {
-		return location
-	}
-	if s.resolver != nil {
-		resolved, err := s.resolver.ResolveSolarSystem(ctx, systemID)
-		if err != nil {
-			s.logger.Warn("alert solar-system enrichment failed", "system_id", systemID, "err", err)
-		} else {
-			location = resolved
-		}
-	}
-	if location.Name == "" {
-		name, err := s.resolveName(ctx, "solar_system", systemID)
-		if err != nil {
-			s.logger.Warn("alert solar-system name enrichment failed", "system_id", systemID, "err", err)
-		} else {
-			location.Name = name
-		}
-	}
-	if location.RegionID != "" && location.RegionName == "" && s.resolver != nil {
-		region, err := s.resolver.ResolveRegion(ctx, location.RegionID)
-		if err != nil {
-			s.logger.Warn("alert region enrichment failed", "region_id", location.RegionID, "err", err)
-		} else {
-			location.RegionName = region.Name
-		}
-	}
-	return location
-}
-
-func (s *Service) resolveAlliance(ctx context.Context, event *notifications.Event) (allianceName, iconURL string, err error) {
-	if event == nil || event.AllianceID == "" {
-		return "", "", nil
-	}
-	allianceName = event.AllianceName
-	if s.resolver == nil {
-		return s.resolveAllianceDatabase(ctx, event.AllianceID, allianceName)
-	}
-	resolved, resolveErr := s.resolver.ResolveAlliance(ctx, event.AllianceID)
-	if resolveErr != nil {
-		s.logger.Warn("alert alliance enrichment failed", "alliance_id", event.AllianceID, "err", resolveErr)
-		return s.resolveAllianceDatabase(ctx, event.AllianceID, allianceName)
-	}
-	if resolved.Name != "" {
-		allianceName = resolved.Name
-	}
-	if allianceName == "" {
-		return s.resolveAllianceDatabase(ctx, event.AllianceID, allianceName)
-	}
-	return allianceName, resolved.IconURL, nil
-}
-
-func (s *Service) resolveAllianceDatabase(ctx context.Context, allianceID, fallback string) (name, iconURL string, err error) {
-	if fallback != "" {
-		return fallback, "", nil
-	}
-	name, err = s.resolveName(ctx, "alliance", allianceID)
-	if err != nil {
-		s.logger.Warn("alert alliance database enrichment failed", "alliance_id", allianceID, "err", err)
-		return fallback, "", nil
-	}
-	return name, "", nil
-}
-
-func (s *Service) enrichAttacker(ctx context.Context, event *notifications.Event) {
-	if event == nil || s.resolver == nil || event.AttackerCharacterID == "" && event.AttackerCorporationID == "" {
-		return
-	}
-	if event.AttackerCharacterName == "" && event.AttackerCharacterID != "" {
-		character, err := s.resolver.ResolveCharacter(ctx, event.AttackerCharacterID)
-		if err != nil {
-			s.logger.Warn("alert attacker character enrichment failed", "character_id", event.AttackerCharacterID, "err", err)
-		} else if character.Name != "" {
-			event.AttackerCharacterName = character.Name
-		}
-	}
-	if event.AttackerCorporationName == "" && event.AttackerCorporationID != "" {
-		corporation, err := s.resolver.ResolveCorporation(ctx, event.AttackerCorporationID)
-		if err != nil {
-			s.logger.Warn("alert attacker corporation enrichment failed", "corporation_id", event.AttackerCorporationID, "err", err)
-		} else if corporation.Name != "" {
-			event.AttackerCorporationName = corporation.Name
-		}
-	}
-	s.enrichAttackerAlliance(ctx, event)
-}
-
-func (s *Service) enrichAttackerAlliance(ctx context.Context, event *notifications.Event) {
-	if event == nil || s.resolver == nil || event.AttackerAllianceName != "" || event.AttackerAllianceID == "" {
-		return
-	}
-	alliance, err := s.resolver.ResolveAlliance(ctx, event.AttackerAllianceID)
-	if err != nil {
-		s.logger.Warn("alert attacker alliance enrichment failed", "alliance_id", event.AttackerAllianceID, "err", err)
-		return
-	}
-	if alliance.Name != "" {
-		event.AttackerAllianceName = alliance.Name
-	}
-}
-
-func (s *Service) enrichActor(ctx context.Context, event *notifications.Event) {
-	if event == nil || s.resolver == nil || event.ActorCharacterID == "" || event.ActorCharacterName != "" {
-		return
-	}
-	character, err := s.resolver.ResolveCharacter(ctx, event.ActorCharacterID)
-	if err != nil {
-		s.logger.Warn("alert actor character enrichment failed", "character_id", event.ActorCharacterID, "err", err)
-		return
-	}
-	if character.Name != "" {
-		event.ActorCharacterName = character.Name
-	}
-}
-
-func (s *Service) enrichOwnership(ctx context.Context, event *notifications.Event) {
-	if event == nil || event.NotificationType != "OwnershipTransferred" {
-		return
-	}
-	if event.NewOwnerCorporationName == "" && event.NewOwnerCorporationID != "" {
-		event.NewOwnerCorporationName = s.resolveCorporationName(ctx, event.NewOwnerCorporationID)
-	}
-	if event.OldOwnerCorporationName == "" && event.OldOwnerCorporationID != "" {
-		event.OldOwnerCorporationName = s.resolveCorporationName(ctx, event.OldOwnerCorporationID)
-	}
-}
-
-func (s *Service) resolveCorporationName(ctx context.Context, corporationID string) string {
-	if s.resolver != nil {
-		corporation, err := s.resolver.ResolveCorporation(ctx, corporationID)
-		if err != nil {
-			s.logger.Warn("alert ownership corporation enrichment failed", "corporation_id", corporationID, "err", err)
-			return ""
-		}
-		return corporation.Name
-	}
-	name, err := s.resolveName(ctx, "corporation", corporationID)
-	if err != nil {
-		s.logger.Warn("alert ownership corporation enrichment failed", "corporation_id", corporationID, "err", err)
-		return ""
-	}
-	return name
-}
-
-func (s *Service) enrichStructures(ctx context.Context, structures []authnextdb.Structure) {
-	if s.resolver == nil {
-		return
-	}
-	for index := range structures {
-		structure := &structures[index]
-		s.enrichStructureLocation(ctx, structure)
-		s.enrichStructureCelestials(ctx, structure)
-	}
-}
-
-func (s *Service) enrichStructureLocation(ctx context.Context, structure *authnextdb.Structure) {
-	if structure == nil || structure.SystemID == "" {
-		return
-	}
-	if structure.SystemName != nil && structure.RegionName != nil {
-		return
-	}
-	location, err := s.resolver.ResolveSolarSystem(ctx, structure.SystemID)
-	if err != nil {
-		s.logger.Warn("alert structure location enrichment failed", "system_id", structure.SystemID, "err", err)
-		return
-	}
-	if structure.SystemName == nil && location.Name != "" {
-		structure.SystemName = new(location.Name)
-	}
-	if structure.RegionName == nil && location.RegionName != "" {
-		structure.RegionName = new(location.RegionName)
-	}
-}
-
-func (s *Service) enrichStructureCelestials(ctx context.Context, structure *authnextdb.Structure) {
-	if structure == nil {
-		return
-	}
-	s.enrichStructurePlanet(ctx, structure)
-	s.enrichStructureMoon(ctx, structure)
-}
-
-func (s *Service) enrichStructurePlanet(ctx context.Context, structure *authnextdb.Structure) {
-	if structure == nil || s.resolver == nil || structure.PlanetID == nil || structure.PlanetName != nil {
-		return
-	}
-	planet, err := s.resolver.ResolvePlanet(ctx, *structure.PlanetID)
-	if err != nil {
-		s.logger.Warn("alert planet enrichment failed", "planet_id", *structure.PlanetID, "err", err)
-		return
-	}
-	if planet.Name != "" {
-		structure.PlanetName = new(planet.Name)
-	}
-}
-
-func (s *Service) enrichStructureMoon(ctx context.Context, structure *authnextdb.Structure) {
-	if structure == nil || s.resolver == nil || structure.MoonID == nil || structure.MoonName != nil {
-		return
-	}
-	moon, err := s.resolver.ResolveMoon(ctx, *structure.MoonID)
-	if err != nil {
-		s.logger.Warn("alert moon enrichment failed", "moon_id", *structure.MoonID, "err", err)
-		return
-	}
-	if moon.Name != "" {
-		structure.MoonName = new(moon.Name)
-	}
-}
-
-func (s *Service) resolveSystemName(ctx context.Context, systemID string) (string, error) {
-	return s.resolveName(ctx, "solar_system", systemID)
-}
-
-func (s *Service) resolveName(ctx context.Context, kind, id string) (string, error) {
-	if id == "" {
-		return "", nil
-	}
-	resolver, ok := s.database.(NameResolver)
-	if !ok {
-		return "", nil
-	}
-	names, err := resolver.ResolveNames(ctx, kind, []string{id})
-	if err != nil {
-		return "", fmt.Errorf("resolve %s %s: %w", kind, id, err)
-	}
-	return names[id], nil
-}
-
-func destinationSelected(requested map[string]struct{}, destination *Destination) bool {
-	if destination == nil {
-		return false
-	}
-	if len(requested) == 0 {
-		return true
-	}
-	if _, ok := requested[destination.ID]; ok {
-		return true
-	}
-	for _, target := range destination.webhookTargets() {
-		if _, ok := requested[target.ID]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 type webhookTarget struct {
-	ID  string
-	URL string
+	ID              string
+	URL             string
+	Presentation    Presentation
+	MentionRules    []MentionRule
+	SenderName      string
+	SenderAvatarURL string
 }
 
-func (d *Destination) webhookTargets() []webhookTarget {
-	if d == nil {
+func compileDiscordDestinations(destinations []Destination) (routingDestinations []routing.Destination, targets map[string]webhookTarget) {
+	routingDestinations = make([]routing.Destination, 0, len(destinations))
+	targets = make(map[string]webhookTarget)
+	for index := range destinations {
+		destination := &destinations[index]
+		routingDestination := compileRoutingDestination(destination)
+		compileWebhookTargets(destination, &routingDestination, targets)
+		routingDestinations = append(routingDestinations, routingDestination)
+	}
+	return routingDestinations, targets
+}
+
+func compileRoutingDestination(destination *Destination) routing.Destination {
+	if destination == nil {
+		return routing.Destination{}
+	}
+	return routing.Destination{
+		ID: destination.ID,
+		Filters: routing.Filters{
+			AlertTypes:              append([]string(nil), destination.AlertTypes...),
+			ExcludeAlertTypes:       append([]string(nil), destination.ExcludeAlertTypes...),
+			ExcludeStructureTypeIDs: append([]string(nil), destination.ExcludeStructureTypeIDs...),
+			IncludeCorporationIDs:   append([]string(nil), destination.IncludeCorporationIDs...),
+			ExcludeCorporationIDs:   append([]string(nil), destination.ExcludeCorporationIDs...),
+		},
+	}
+}
+
+func compileWebhookTargets(destination *Destination, routingDestination *routing.Destination, targets map[string]webhookTarget) {
+	if destination == nil || routingDestination == nil || targets == nil {
+		return
+	}
+	webhookTargets := destination.WebhookTargets
+	if len(webhookTargets) == 0 {
+		webhookTargets = webhookTargetsFromURLs(destination)
+	}
+	for targetIndex := range webhookTargets {
+		target := &webhookTargets[targetIndex]
+		webhookURL := strings.TrimRight(strings.TrimSpace(target.URL), "/")
+		if webhookURL == "" {
+			continue
+		}
+		targetID := strings.TrimSpace(target.ID)
+		if targetID == "" {
+			targetID = fmt.Sprintf("%s#%d", destination.ID, targetIndex+1)
+		}
+		routingDestination.TargetIDs = append(routingDestination.TargetIDs, targetID)
+		targets[targetID] = webhookTarget{
+			ID:              targetID,
+			URL:             webhookURL,
+			Presentation:    destination.Presentation,
+			MentionRules:    append([]MentionRule(nil), destination.MentionRules...),
+			SenderName:      destination.SenderName,
+			SenderAvatarURL: destination.SenderAvatarURL,
+		}
+	}
+}
+
+func webhookTargetsFromURLs(destination *Destination) []WebhookTarget {
+	if destination == nil {
 		return nil
 	}
-	urls := d.WebhookURLs
-	targets := make([]webhookTarget, 0, len(urls))
-	for i, webhookURL := range urls {
-		targetID := d.ID
-		if len(urls) > 1 {
-			targetID = fmt.Sprintf("%s#%d", d.ID, i+1)
+	targets := make([]WebhookTarget, 0, len(destination.WebhookURLs))
+	for targetIndex, rawURL := range destination.WebhookURLs {
+		targetID := destination.ID
+		if len(destination.WebhookURLs) > 1 {
+			targetID = fmt.Sprintf("%s#%d", destination.ID, targetIndex+1)
 		}
-		targets = append(targets, webhookTarget{ID: targetID, URL: webhookURL})
+		targets = append(targets, WebhookTarget{ID: targetID, URL: rawURL})
 	}
 	return targets
 }
 
-func flattenWebhookTargets(destinations []Destination, requested map[string]struct{}) []webhookTarget {
-	flattened := make([]webhookTarget, 0, len(destinations))
-	seenURLs := make(map[string]struct{})
-	for i := range destinations {
-		destination := &destinations[i]
-		for _, target := range destination.webhookTargets() {
-			if !webhookTargetSelected(requested, destination.ID, target.ID) {
+func (s *Service) webhookTargets(targetIDs []string) []webhookTarget {
+	if s == nil || s.routing == nil || len(s.targets) == 0 {
+		return nil
+	}
+	targets := make([]webhookTarget, 0, len(targetIDs))
+	seenURLs := make(map[string]struct{}, len(targetIDs))
+	for _, targetID := range targetIDs {
+		if target, ok := s.targets[targetID]; ok {
+			if _, duplicate := seenURLs[target.URL]; duplicate {
 				continue
 			}
-			key := webhookURLKey(target.URL)
-			if _, ok := seenURLs[key]; ok {
-				continue
-			}
-			seenURLs[key] = struct{}{}
-			flattened = append(flattened, target)
+			seenURLs[target.URL] = struct{}{}
+			targets = append(targets, target)
 		}
 	}
-	return flattened
+	return targets
 }
 
-func webhookURLKey(raw string) string {
-	return strings.TrimRight(strings.TrimSpace(raw), "/")
+func (s *Service) uniqueWebhookTargetIDs(targetIDs []string) []string {
+	if s == nil || len(targetIDs) == 0 {
+		return nil
+	}
+	selected := make([]string, 0, len(targetIDs))
+	seenIDs := make(map[string]struct{}, len(targetIDs))
+	seenURLs := make(map[string]struct{}, len(targetIDs))
+	for _, targetID := range targetIDs {
+		if _, duplicate := seenIDs[targetID]; duplicate {
+			continue
+		}
+		seenIDs[targetID] = struct{}{}
+		target, known := s.targets[targetID]
+		if known {
+			if _, duplicate := seenURLs[target.URL]; duplicate {
+				continue
+			}
+			seenURLs[target.URL] = struct{}{}
+		}
+		selected = append(selected, targetID)
+	}
+	return selected
 }
 
-func webhookTargetSelected(requested map[string]struct{}, destinationID, targetID string) bool {
-	if len(requested) == 0 {
-		return true
+func (s *Service) webhookTarget(targetID string) *webhookTarget {
+	if s == nil || s.routing == nil || len(s.targets) == 0 {
+		return nil
 	}
-	if _, ok := requested[destinationID]; ok {
-		return true
+	target, ok := s.targets[targetID]
+	if !ok {
+		return nil
 	}
-	_, ok := requested[targetID]
-	return ok
+	return &target
 }
 
 func (s *Service) deliverTarget(ctx context.Context, target *webhookTarget, view *eventView) error {
 	if target == nil || view == nil {
 		return errors.New("alert webhook target and event view are required")
 	}
-	message := render(view, s.overrideSenderName, s.overrideSenderAvatarURL)
+	s.logDestinationResolved(view, target.ID)
+	message := renderForTarget(view, target)
 	startedAt := time.Now()
 	s.logger.Debug("Discord alert delivery started",
 		"destination_id", target.ID,
@@ -839,7 +565,11 @@ func (s *Service) deliverTarget(ctx context.Context, target *webhookTarget, view
 }
 
 func (s *Service) recordHistory(ctx context.Context, destinationID string, view *eventView, message *discord.Message) error {
-	if s.history == nil || view == nil || message == nil {
+	return s.recordHistoryOutcome(ctx, destinationID, view, message, notificationstate.AlertDeliveryStatusDelivered, "")
+}
+
+func (s *Service) recordHistoryOutcome(ctx context.Context, destinationID string, view *eventView, message *discord.Message, deliveryStatus, deliveryError string) error {
+	if s == nil || s.history == nil || view == nil || message == nil {
 		return nil
 	}
 	rawNotification := append([]byte(nil), view.RawNotificationJSON...)
@@ -854,7 +584,7 @@ func (s *Service) recordHistory(ctx context.Context, destinationID string, view 
 	if err != nil {
 		return fmt.Errorf("encode Discord payload: %w", err)
 	}
-	return s.history.RecordAlert(ctx, &notificationstate.AlertHistoryRecord{
+	return recordHistoryWithRetry(ctx, s.history, &notificationstate.AlertHistoryRecord{
 		NotificationID:      view.Event.NotificationID,
 		NotificationType:    view.Event.NotificationType,
 		AlertType:           view.Event.AlertType,
@@ -863,6 +593,8 @@ func (s *Service) recordHistory(ctx context.Context, destinationID string, view 
 		CorporationTicker:   view.PollingCorporationTicker,
 		CharacterID:         view.CharacterID,
 		DestinationID:       destinationID,
+		DeliveryStatus:      deliveryStatus,
+		DeliveryError:       deliveryError,
 		DispatchedAt:        time.Now().UTC(),
 		RawNotificationJSON: rawNotification,
 		ClassifiedEventJSON: eventJSON,
@@ -870,164 +602,48 @@ func (s *Service) recordHistory(ctx context.Context, destinationID string, view 
 	})
 }
 
-func compileAlertRouting(includedSelectors, excludedSelectors []string) (alertRouting, error) {
-	routing := alertRouting{
-		included: make(map[string]struct{}),
-		excluded: make(map[string]struct{}),
+func recordHistoryWithRetry(ctx context.Context, history notificationstate.AlertHistory, record *notificationstate.AlertHistoryRecord) error {
+	if ctx == nil {
+		return errors.New("alert history context is required")
 	}
-	if err := addIncludedAlertSelectors(&routing, includedSelectors); err != nil {
-		return alertRouting{}, err
+	if history == nil {
+		return nil
 	}
-	if err := addExcludedAlertSelectors(&routing, excludedSelectors); err != nil {
-		return alertRouting{}, err
-	}
-	return routing, nil
-}
 
-func addIncludedAlertSelectors(routing *alertRouting, selectors []string) error {
-	for _, selector := range selectors {
-		alertTypes, err := expandIncludedAlertSelector(selector)
-		if err != nil {
-			return fmt.Errorf("include selector %q: %w", selector, err)
+	var lastErr error
+	for attempt := 1; attempt <= historyWriteAttempts; attempt++ {
+		lastErr = recordAlertSafely(ctx, history, record)
+		if lastErr == nil {
+			return nil
 		}
-		for _, alertType := range alertTypes {
-			routing.included[alertType] = struct{}{}
+		if attempt == historyWriteAttempts {
+			break
 		}
-	}
-	return nil
-}
-
-func expandIncludedAlertSelector(selector string) ([]string, error) {
-	selector = strings.ToLower(strings.TrimSpace(selector))
-	if selector == "all" || selector == "*" {
-		return notifications.AllAlertTypes(), nil
-	}
-	return notifications.ExpandAlertSelector(selector)
-}
-
-func addExcludedAlertSelectors(routing *alertRouting, selectors []string) error {
-	for _, selector := range selectors {
-		alertType, err := resolveExcludedAlertSelector(selector)
-		if err != nil {
+		if err := waitForHistoryRetry(ctx); err != nil {
 			return err
 		}
-		routing.excluded[alertType] = struct{}{}
 	}
-	return nil
+	return lastErr
 }
 
-func resolveExcludedAlertSelector(selector string) (string, error) {
-	canonical, err := notifications.NormalizeAlertSelector(selector)
-	if err != nil {
-		return "", fmt.Errorf("exclude selector %q: %w", selector, err)
+func waitForHistoryRetry(ctx context.Context) error {
+	timer := time.NewTimer(historyRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	alertTypes, err := notifications.ExpandAlertSelector(canonical)
-	if err != nil {
-		return "", fmt.Errorf("exclude selector %q: %w", selector, err)
-	}
-	if notifications.IsAlertGroup(canonical) || len(alertTypes) != 1 {
-		return "", fmt.Errorf("exclude selector %q is not a leaf", selector)
-	}
-	return alertTypes[0], nil
 }
 
-func (r alertRouting) supports(alertType string) bool {
-	if _, excluded := r.excluded[alertType]; excluded {
-		return false
-	}
-	_, included := r.included[alertType]
-	return included
-}
-
-func compileCorporationFilter(included, excluded []string) corporationFilter {
-	filter := corporationFilter{
-		included: make(map[string]struct{}, len(included)),
-		excluded: make(map[string]struct{}, len(excluded)),
-	}
-	for _, corporationID := range included {
-		filter.included[strings.TrimSpace(corporationID)] = struct{}{}
-	}
-	for _, corporationID := range excluded {
-		filter.excluded[strings.TrimSpace(corporationID)] = struct{}{}
-	}
-	return filter
-}
-
-func (f corporationFilter) supports(corporationID string) bool {
-	corporationID = strings.TrimSpace(corporationID)
-	if _, excluded := f.excluded[corporationID]; excluded {
-		return false
-	}
-	if len(f.included) == 0 {
-		return true
-	}
-	_, included := f.included[corporationID]
-	return included
-}
-
-func supports(alertTypes, excludedAlertTypes []string, alertType string) bool {
-	routing, err := compileAlertRouting(alertTypes, excludedAlertTypes)
-	return err == nil && routing.supports(alertType)
-}
-
-func destinationExcludesStructureType(destination *Destination, view *eventView) bool {
-	if destination == nil || view == nil || len(destination.ExcludeStructureTypeIDs) == 0 {
-		return false
-	}
-	if view.Event.NotificationType == "StructuresReinforcementChanged" {
-		for i := range view.Structures {
-			if slices.Contains(destination.ExcludeStructureTypeIDs, strings.TrimSpace(view.Structures[i].TypeID)) {
-				return true
-			}
+func recordAlertSafely(ctx context.Context, history notificationstate.AlertHistory, record *notificationstate.AlertHistoryRecord) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errors.New("alert history persistence panic")
 		}
-		return false
-	}
-	if typeID := strings.TrimSpace(view.Event.StructureTypeID); typeID != "" {
-		return slices.Contains(destination.ExcludeStructureTypeIDs, typeID)
-	}
-	for i := range view.Structures {
-		if slices.Contains(destination.ExcludeStructureTypeIDs, strings.TrimSpace(view.Structures[i].TypeID)) {
-			return true
-		}
-	}
-	return false
-}
-
-func structureTypeID(view *eventView) string {
-	if view == nil {
-		return ""
-	}
-	if typeID := strings.TrimSpace(view.Event.StructureTypeID); typeID != "" {
-		return typeID
-	}
-	for i := range view.Structures {
-		if typeID := strings.TrimSpace(view.Structures[i].TypeID); typeID != "" {
-			return typeID
-		}
-	}
-	return ""
-}
-
-func structureTypeIDFromStructures(typeID string, structures []authnextdb.Structure) string {
-	if typeID = strings.TrimSpace(typeID); typeID != "" {
-		return typeID
-	}
-	for index := range structures {
-		if typeID := strings.TrimSpace(structures[index].TypeID); typeID != "" {
-			return typeID
-		}
-	}
-	return ""
-}
-
-func structureTypeIDForEvent(event *notifications.Event, structures []authnextdb.Structure) string {
-	if event == nil {
-		return ""
-	}
-	if event.NotificationType == "StructuresReinforcementChanged" {
-		return ""
-	}
-	return structureTypeIDFromStructures(event.StructureTypeID, structures)
+	}()
+	return history.RecordAlert(ctx, record)
 }
 
 func (s *Service) logDestinationsResolved(request *DeliveryRequest, count int) {
@@ -1042,6 +658,21 @@ func (s *Service) logDestinationsResolved(request *DeliveryRequest, count int) {
 	s.logger.Debug("alert destinations resolved", attrs...)
 }
 
+func (s *Service) logDestinationResolved(view *eventView, destinationID string) {
+	if s == nil || s.logger == nil || view == nil {
+		return
+	}
+	attrs := []any{
+		"notification_id", view.Event.NotificationID,
+		"alert_type", view.Event.AlertType,
+		"destination_id", destinationID,
+	}
+	if s.logPayloads && len(view.RawNotificationJSON) > 0 {
+		attrs = append(attrs, "raw_payload", logPayload(view.RawNotificationJSON))
+	}
+	s.logger.Debug("alert destination resolved", attrs...)
+}
+
 func logPayload(payload []byte) string {
 	if len(payload) <= maxLoggedPayloadBytes {
 		return string(payload)
@@ -1049,29 +680,7 @@ func logPayload(payload []byte) string {
 	return string(payload[:maxLoggedPayloadBytes]) + "...[truncated]"
 }
 
-type eventView struct {
-	CorporationID            string
-	CorporationName          string
-	CorporationTicker        string
-	CorporationOwned         bool
-	SystemName               string
-	RegionID                 string
-	RegionName               string
-	AllianceName             string
-	AllianceIconURL          string
-	ShowEntityIDs            bool
-	PlanetName               string
-	MoonName                 string
-	Event                    notifications.Event
-	Structures               []authnextdb.Structure
-	StructureTypeName        string
-	StructureTypeNames       map[string]string
-	CharacterID              string
-	RawNotificationJSON      []byte
-	PollingCorporationID     string
-	PollingCorporationName   string
-	PollingCorporationTicker string
-}
+type eventView = enrichment.Context
 
 type reinforcementCoverageRegion struct {
 	label   string
@@ -1085,6 +694,7 @@ type reinforcementCoverageSystem struct {
 
 type reinforcementCoverageType struct {
 	label string
+	names []string
 	count int
 }
 
@@ -1111,6 +721,49 @@ func render(view *eventView, senderName, avatarURL string) discord.Message {
 			Author:      author,
 		}},
 		AllowedMentions: discord.AllowedMentions{Parse: []string{}},
+	}
+}
+
+func renderForTarget(view *eventView, target *webhookTarget) discord.Message {
+	if view == nil {
+		return discord.Message{}
+	}
+	if target == nil {
+		return render(view, "", "")
+	}
+	presentation := *view
+	presentation.ShowEntityIDs = target.Presentation.ShowEntityIDs
+	message := render(&presentation, target.SenderName, target.SenderAvatarURL)
+	if mention := mentionFor(target.MentionRules, view.Event.AlertType); mention != "" {
+		message.Content = mention
+		message.AllowedMentions = discord.AllowedMentions{Parse: []string{"everyone"}}
+	}
+	return message
+}
+
+func mentionFor(rules []MentionRule, alertType string) string {
+	bestSpecificity := -1
+	mention := ""
+	for index := range rules {
+		rule := &rules[index]
+		for _, selector := range rule.AlertTypes {
+			if !notifications.AlertTypeInGroup(alertType, selector) && selector != alertType {
+				continue
+			}
+			specificity := strings.Count(selector, ".") + 1
+			if specificity > bestSpecificity {
+				bestSpecificity = specificity
+				mention = rule.Mention
+			}
+		}
+	}
+	switch mention {
+	case "here":
+		return "@here"
+	case "everyone":
+		return "@everyone"
+	default:
+		return ""
 	}
 }
 
@@ -1299,16 +952,17 @@ func reinforcementCoverageField(view *eventView) []discord.Field {
 	lines := make([]string, 0)
 	for _, regionKey := range regionKeys {
 		region := regions[regionKey]
-		lines = append(lines, region.label)
+		lines = append(lines, "**"+region.label+"**")
 		lines = append(lines, reinforcementCoverageSystemLines(region)...)
 	}
 	return []discord.Field{{Name: "Structure Coverage", Value: truncate(strings.Join(lines, "\n"), maxStructureSummarySize), Inline: false}}
 }
 
 func reinforcementCoverageGroups(view *eventView) map[string]*reinforcementCoverageRegion {
-	regions := make(map[string]*reinforcementCoverageRegion, len(view.Structures))
-	for index := range view.Structures {
-		structure := &view.Structures[index]
+	structures := reinforcementCoverageStructures(view)
+	regions := make(map[string]*reinforcementCoverageRegion, len(structures))
+	for index := range structures {
+		structure := &structures[index]
 		regionKey, regionLabel, systemKey, systemLabel := reinforcementCoverageLocation(view, structure)
 		region := regions[regionKey]
 		if region == nil {
@@ -1324,10 +978,44 @@ func reinforcementCoverageGroups(view *eventView) map[string]*reinforcementCover
 		structureType := system.types[typeKey]
 		structureType.label = typeLabel
 		structureType.count++
+		if name := reinforcementCoverageStructureName(view, structure); name != "" && !slices.Contains(structureType.names, name) {
+			structureType.names = append(structureType.names, name)
+			slices.Sort(structureType.names)
+		}
 		system.types[typeKey] = structureType
 		region.systems[systemKey] = system
 	}
 	return regions
+}
+
+func reinforcementCoverageStructures(view *eventView) []authnextdb.Structure {
+	if view == nil {
+		return nil
+	}
+	structures := append([]authnextdb.Structure(nil), view.Structures...)
+	if len(view.Event.StructureReferences) == 0 {
+		return structures
+	}
+	known := make(map[string]struct{}, len(structures))
+	for index := range structures {
+		known[structures[index].ID] = struct{}{}
+	}
+	for _, reference := range view.Event.StructureReferences {
+		if reference.ID == "" {
+			continue
+		}
+		if _, ok := known[reference.ID]; ok {
+			continue
+		}
+		name := strings.TrimSpace(reference.Name)
+		structures = append(structures, authnextdb.Structure{
+			ID:     reference.ID,
+			Name:   &name,
+			TypeID: strings.TrimSpace(reference.TypeID),
+		})
+		known[reference.ID] = struct{}{}
+	}
+	return structures
 }
 
 func reinforcementCoverageLocation(view *eventView, structure *authnextdb.Structure) (regionKey, regionDisplay, systemKey, systemDisplay string) {
@@ -1356,6 +1044,14 @@ func reinforcementCoverageLocation(view *eventView, structure *authnextdb.Struct
 
 func reinforcementCoverageTypeLabel(view *eventView, structure *authnextdb.Structure) (key, label string) {
 	typeID := strings.TrimSpace(structure.TypeID)
+	if typeID == "" {
+		for _, reference := range view.Event.StructureReferences {
+			if reference.ID == structure.ID {
+				typeID = strings.TrimSpace(reference.TypeID)
+				break
+			}
+		}
+	}
 	label = ""
 	if view.StructureTypeNames != nil {
 		label = strings.TrimSpace(view.StructureTypeNames[typeID])
@@ -1376,6 +1072,21 @@ func reinforcementCoverageTypeLabel(view *eventView, structure *authnextdb.Struc
 	return key, label
 }
 
+func reinforcementCoverageStructureName(view *eventView, structure *authnextdb.Structure) string {
+	if view == nil || structure == nil {
+		return ""
+	}
+	if name := optionalString(structure.Name); name != "" {
+		return name
+	}
+	for _, reference := range view.Event.StructureReferences {
+		if reference.ID == structure.ID {
+			return strings.TrimSpace(reference.Name)
+		}
+	}
+	return ""
+}
+
 func reinforcementCoverageSystemLines(region *reinforcementCoverageRegion) []string {
 	if region == nil {
 		return nil
@@ -1388,7 +1099,7 @@ func reinforcementCoverageSystemLines(region *reinforcementCoverageRegion) []str
 	lines := make([]string, 0, len(systemKeys))
 	for _, systemKey := range systemKeys {
 		system := region.systems[systemKey]
-		lines = append(lines, "  "+system.label)
+		lines = append(lines, "- **"+system.label+"**")
 		typeKeys := reinforcementCoverageTypeKeys(system)
 		for _, typeKey := range typeKeys {
 			coverage := system.types[typeKey]
@@ -1396,7 +1107,10 @@ func reinforcementCoverageSystemLines(region *reinforcementCoverageRegion) []str
 			if coverage.count == 1 {
 				noun = "structure"
 			}
-			lines = append(lines, fmt.Sprintf("    %s - %d %s", coverage.label, coverage.count, noun))
+			lines = append(lines, fmt.Sprintf("  - **%s** (%d %s)", escapeMarkdown(coverage.label), coverage.count, noun))
+			for _, name := range coverage.names {
+				lines = append(lines, "    - "+escapeMarkdown(name))
+			}
 		}
 	}
 	return lines

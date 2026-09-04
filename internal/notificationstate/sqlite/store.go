@@ -18,6 +18,7 @@ import (
 const (
 	maxStateBytes          = 2 << 20
 	maxHistoryPayloadBytes = 512 << 10
+	maxHistoryErrorBytes   = 4 << 10
 	defaultPendingLimit    = 32
 	defaultHistoryLimit    = 100
 	alertHistoryRetention  = 30 * 24 * time.Hour
@@ -32,7 +33,7 @@ type Store struct {
 var _ notificationstate.Store = (*Store)(nil)
 var _ notificationstate.AlertHistory = (*Store)(nil)
 
-// NewStore opens or creates a durable cursor database and applies pending migrations using ctx.
+// NewStore opens or creates a durable cursor database and applies Goose migrations using ctx.
 func NewStore(ctx context.Context, path string) (*Store, error) {
 	if ctx == nil {
 		return nil, errors.New("notification state database context is required")
@@ -72,6 +73,9 @@ func (s *Store) Close() error {
 
 // Load returns the persisted cursor or an empty cursor when none exists.
 func (s *Store) Load(ctx context.Context, corporationID string) (notificationstate.Cursor, error) {
+	if err := s.validateContext(ctx); err != nil {
+		return notificationstate.Cursor{}, err
+	}
 	stateJSON, err := s.queries.GetCursor(ctx, corporationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return notificationstate.Cursor{}, nil
@@ -91,6 +95,9 @@ func (s *Store) Load(ctx context.Context, corporationID string) (notificationsta
 
 // Save replaces the persisted cursor for one corporation.
 func (s *Store) Save(ctx context.Context, corporationID string, cursor notificationstate.Cursor) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
 	encoded, err := json.Marshal(cursor)
 	if err != nil {
 		return fmt.Errorf("encode notification cursor: %w", err)
@@ -106,6 +113,9 @@ func (s *Store) Save(ctx context.Context, corporationID string, cursor notificat
 
 // MarkSeen atomically claims a globally unique notification ID.
 func (s *Store) MarkSeen(ctx context.Context, notificationID int64) (bool, error) {
+	if err := s.validateContext(ctx); err != nil {
+		return false, err
+	}
 	result, err := s.queries.MarkSeen(ctx, notificationID)
 	if err != nil {
 		return false, fmt.Errorf("mark notification %d seen: %w", notificationID, err)
@@ -117,62 +127,91 @@ func (s *Store) MarkSeen(ctx context.Context, notificationID int64) (bool, error
 	return rows == 1, nil
 }
 
-// ClaimPending atomically claims a notification and stores its retry payload.
-func (s *Store) ClaimPending(ctx context.Context, pending *notificationstate.PendingNotification) (bool, error) {
-	if pending == nil {
-		return false, errors.New("pending notification is required")
+// Admit atomically marks a notification seen, persists its cursor, and stores
+// its pending delivery payload when one is supplied.
+func (s *Store) Admit(ctx context.Context, admission *notificationstate.Admission) (bool, error) {
+	if s == nil {
+		return false, errors.New("notification store is unavailable")
 	}
-	if err := validatePending(pending); err != nil {
+	if ctx == nil {
+		return false, errors.New("notification admission context is required")
+	}
+	if err := admission.Validate(); err != nil {
 		return false, err
 	}
-	failedDestinations, err := json.Marshal(pending.FailedDestinationIDs)
+	cursorJSON, err := json.Marshal(admission.Cursor)
 	if err != nil {
-		return false, fmt.Errorf("encode pending notification destinations: %w", err)
+		return false, fmt.Errorf("encode notification cursor: %w", err)
+	}
+	if len(cursorJSON) > maxStateBytes {
+		return false, errors.New("notification cursor exceeds size limit")
+	}
+	pendingData, err := encodePending(admission.Pending)
+	if err != nil {
+		return false, err
+	}
+	return s.admitTransaction(ctx, admission, cursorJSON, &pendingData)
+}
+
+type encodedPending struct {
+	destinationIDs []byte
+	deliveredIDs   []byte
+	failedIDs      []byte
+	createdAt      time.Time
+}
+
+func encodePending(pending *notificationstate.PendingNotification) (encodedPending, error) {
+	if pending == nil {
+		return encodedPending{}, nil
+	}
+	destinationIDs, err := json.Marshal(pending.DestinationIDs)
+	if err != nil {
+		return encodedPending{}, fmt.Errorf("encode pending notification destinations: %w", err)
+	}
+	deliveredIDs, err := json.Marshal(pending.DeliveredDestinationIDs)
+	if err != nil {
+		return encodedPending{}, fmt.Errorf("encode delivered notification destinations: %w", err)
+	}
+	failedIDs, err := json.Marshal(pending.FailedDestinationIDs)
+	if err != nil {
+		return encodedPending{}, fmt.Errorf("encode failed notification destinations: %w", err)
 	}
 	createdAt := pending.CreatedAt
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("begin pending notification claim: %w", err)
+	return encodedPending{destinationIDs: destinationIDs, deliveredIDs: deliveredIDs, failedIDs: failedIDs, createdAt: createdAt}, nil
+}
+
+func insertPending(ctx context.Context, queries *gen.Queries, pending *notificationstate.PendingNotification, data *encodedPending) error {
+	if queries == nil || pending == nil {
+		return errors.New("pending notification storage is unavailable")
 	}
-	defer func() { _ = tx.Rollback() }()
-	queries := s.queries.WithTx(tx)
-	result, err := queries.MarkSeen(ctx, pending.NotificationID)
-	if err != nil {
-		return false, fmt.Errorf("mark pending notification seen: %w", err)
+	if data == nil {
+		return errors.New("pending notification encoding is required")
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("inspect pending notification claim: %w", err)
-	}
-	if rows == 0 {
-		return false, nil
-	}
-	if err := queries.InsertPending(ctx, gen.InsertPendingParams{
-		NotificationID:           pending.NotificationID,
-		CorporationID:            pending.CorporationID,
-		CorporationName:          pending.CorporationName,
-		CorporationTicker:        pending.CorporationTicker,
-		CharacterID:              pending.CharacterID,
-		NotificationJson:         pending.NotificationJSON,
-		FailedDestinationIdsJson: failedDestinations,
-		Attempts:                 int64(pending.Attempts),
-		CreatedAt:                createdAt.Unix(),
-		NextRetryAt:              pending.NextRetryAt.Unix(),
-		LastError:                pending.LastError,
-	}); err != nil {
-		return false, fmt.Errorf("store pending notification: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit pending notification claim: %w", err)
-	}
-	return true, nil
+	return queries.InsertPending(ctx, gen.InsertPendingParams{
+		NotificationID:              pending.NotificationID,
+		CorporationID:               pending.CorporationID,
+		CorporationName:             pending.CorporationName,
+		CorporationTicker:           pending.CorporationTicker,
+		CharacterID:                 pending.CharacterID,
+		NotificationJson:            pending.NotificationJSON,
+		DestinationIdsJson:          data.destinationIDs,
+		DeliveredDestinationIdsJson: data.deliveredIDs,
+		FailedDestinationIdsJson:    data.failedIDs,
+		Attempts:                    int64(pending.Attempts),
+		CreatedAt:                   data.createdAt.Unix(),
+		NextRetryAt:                 pending.NextRetryAt.Unix(),
+		LastError:                   pending.LastError,
+	})
 }
 
 // ListPending returns due retry payloads in deterministic order.
 func (s *Store) ListPending(ctx context.Context, limit int, now time.Time) ([]notificationstate.PendingNotification, error) {
+	if err := s.validateContext(ctx); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = defaultPendingLimit
 	}
@@ -183,27 +222,8 @@ func (s *Store) ListPending(ctx context.Context, limit int, now time.Time) ([]no
 	items := make([]notificationstate.PendingNotification, 0, len(rows))
 	for i := range rows {
 		row := &rows[i]
-		var failedDestinations []string
-		if err := json.Unmarshal(row.FailedDestinationIdsJson, &failedDestinations); err != nil {
-			if err := s.dropMalformedPending(ctx, row.NotificationID, fmt.Errorf("decode destinations: %w", err)); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		pending := notificationstate.PendingNotification{
-			NotificationID:       row.NotificationID,
-			CorporationID:        row.CorporationID,
-			CorporationName:      row.CorporationName,
-			CorporationTicker:    row.CorporationTicker,
-			CharacterID:          row.CharacterID,
-			NotificationJSON:     append([]byte(nil), row.NotificationJson...),
-			FailedDestinationIDs: failedDestinations,
-			Attempts:             int(row.Attempts),
-			CreatedAt:            time.Unix(row.CreatedAt, 0).UTC(),
-			NextRetryAt:          time.Unix(row.NextRetryAt, 0).UTC(),
-			LastError:            row.LastError,
-		}
-		if err := pending.Validate(); err != nil {
+		pending, err := decodePending(row)
+		if err != nil {
 			if err := s.dropMalformedPending(ctx, row.NotificationID, err); err != nil {
 				return nil, err
 			}
@@ -214,8 +234,46 @@ func (s *Store) ListPending(ctx context.Context, limit int, now time.Time) ([]no
 	return items, nil
 }
 
+func decodePending(row *gen.ListPendingRow) (notificationstate.PendingNotification, error) {
+	if row == nil {
+		return notificationstate.PendingNotification{}, errors.New("pending notification row is required")
+	}
+	var destinationIDs, deliveredDestinations, failedDestinations []string
+	if err := json.Unmarshal(row.DestinationIdsJson, &destinationIDs); err != nil {
+		return notificationstate.PendingNotification{}, fmt.Errorf("decode destinations: %w", err)
+	}
+	if err := json.Unmarshal(row.DeliveredDestinationIdsJson, &deliveredDestinations); err != nil {
+		return notificationstate.PendingNotification{}, fmt.Errorf("decode delivered destinations: %w", err)
+	}
+	if err := json.Unmarshal(row.FailedDestinationIdsJson, &failedDestinations); err != nil {
+		return notificationstate.PendingNotification{}, fmt.Errorf("decode failed destinations: %w", err)
+	}
+	pending := notificationstate.PendingNotification{
+		NotificationID:          row.NotificationID,
+		CorporationID:           row.CorporationID,
+		CorporationName:         row.CorporationName,
+		CorporationTicker:       row.CorporationTicker,
+		CharacterID:             row.CharacterID,
+		NotificationJSON:        append([]byte(nil), row.NotificationJson...),
+		DestinationIDs:          destinationIDs,
+		DeliveredDestinationIDs: deliveredDestinations,
+		FailedDestinationIDs:    failedDestinations,
+		Attempts:                int(row.Attempts),
+		CreatedAt:               time.Unix(row.CreatedAt, 0).UTC(),
+		NextRetryAt:             time.Unix(row.NextRetryAt, 0).UTC(),
+		LastError:               row.LastError,
+	}
+	if err := pending.Validate(); err != nil {
+		return notificationstate.PendingNotification{}, err
+	}
+	return pending, nil
+}
+
 // ReschedulePending updates retry metadata for one pending notification.
 func (s *Store) ReschedulePending(ctx context.Context, pending *notificationstate.PendingNotification) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
 	if pending == nil {
 		return errors.New("pending notification is required")
 	}
@@ -226,12 +284,17 @@ func (s *Store) ReschedulePending(ctx context.Context, pending *notificationstat
 	if err != nil {
 		return fmt.Errorf("encode pending notification destinations: %w", err)
 	}
+	deliveredDestinations, err := json.Marshal(pending.DeliveredDestinationIDs)
+	if err != nil {
+		return fmt.Errorf("encode delivered notification destinations: %w", err)
+	}
 	rows, err := s.queries.ReschedulePending(ctx, gen.ReschedulePendingParams{
-		FailedDestinationIdsJson: failedDestinations,
-		Attempts:                 int64(pending.Attempts),
-		NextRetryAt:              pending.NextRetryAt.Unix(),
-		LastError:                pending.LastError,
-		NotificationID:           pending.NotificationID,
+		DeliveredDestinationIdsJson: deliveredDestinations,
+		FailedDestinationIdsJson:    failedDestinations,
+		Attempts:                    int64(pending.Attempts),
+		NextRetryAt:                 pending.NextRetryAt.Unix(),
+		LastError:                   pending.LastError,
+		NotificationID:              pending.NotificationID,
 	})
 	if err != nil {
 		return fmt.Errorf("reschedule pending notification: %w", err)
@@ -244,6 +307,9 @@ func (s *Store) ReschedulePending(ctx context.Context, pending *notificationstat
 
 // DeletePending removes a completed or permanently failed notification retry.
 func (s *Store) DeletePending(ctx context.Context, notificationID int64) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
 	if err := s.queries.DeletePending(ctx, notificationID); err != nil {
 		return fmt.Errorf("delete pending notification: %w", err)
 	}
@@ -252,15 +318,21 @@ func (s *Store) DeletePending(ctx context.Context, notificationID int64) error {
 
 // PruneSeen removes globally seen IDs older than before.
 func (s *Store) PruneSeen(ctx context.Context, before time.Time) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
 	if err := s.queries.PruneSeen(ctx, before.Unix()); err != nil {
 		return fmt.Errorf("prune seen notifications: %w", err)
 	}
 	return nil
 }
 
-// RecordAlert stores one successfully accepted Discord payload and prunes
-// history older than the supplied retention policy.
+// RecordAlert stores one terminal Discord delivery outcome and prunes history
+// older than the supplied retention policy.
 func (s *Store) RecordAlert(ctx context.Context, record *notificationstate.AlertHistoryRecord) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
 	if record == nil {
 		return errors.New("alert history record is required")
 	}
@@ -271,6 +343,9 @@ func (s *Store) RecordAlert(ctx context.Context, record *notificationstate.Alert
 		len(record.ClassifiedEventJSON) > maxHistoryPayloadBytes ||
 		len(record.DiscordPayloadJSON) > maxHistoryPayloadBytes {
 		return errors.New("alert history payload exceeds size limit")
+	}
+	if len(record.DeliveryError) > maxHistoryErrorBytes {
+		return errors.New("alert history delivery error exceeds size limit")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -287,6 +362,8 @@ func (s *Store) RecordAlert(ctx context.Context, record *notificationstate.Alert
 		CorporationTicker:   record.CorporationTicker,
 		CharacterID:         record.CharacterID,
 		DestinationID:       record.DestinationID,
+		DeliveryStatus:      record.DeliveryStatus,
+		DeliveryError:       record.DeliveryError,
 		DispatchedAt:        record.DispatchedAt.Unix(),
 		RawNotificationJson: append([]byte(nil), record.RawNotificationJSON...),
 		ClassifiedEventJson: append([]byte(nil), record.ClassifiedEventJSON...),
@@ -306,6 +383,9 @@ func (s *Store) RecordAlert(ctx context.Context, record *notificationstate.Alert
 // ListAlertHistory returns recent alert deliveries at or after since, newest
 // first, up to limit records.
 func (s *Store) ListAlertHistory(ctx context.Context, since time.Time, limit int) ([]notificationstate.AlertHistoryRecord, error) {
+	if err := s.validateContext(ctx); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = defaultHistoryLimit
 	}
@@ -321,6 +401,9 @@ func (s *Store) ListAlertHistory(ctx context.Context, since time.Time, limit int
 			len(row.DiscordPayloadJson) > maxHistoryPayloadBytes {
 			return nil, errors.New("alert history payload exceeds size limit")
 		}
+		if len(row.DeliveryError) > maxHistoryErrorBytes {
+			return nil, errors.New("alert history delivery error exceeds size limit")
+		}
 		items = append(items, notificationstate.AlertHistoryRecord{
 			NotificationID:      row.NotificationID,
 			NotificationType:    row.NotificationType,
@@ -330,6 +413,8 @@ func (s *Store) ListAlertHistory(ctx context.Context, since time.Time, limit int
 			CorporationTicker:   row.CorporationTicker,
 			CharacterID:         row.CharacterID,
 			DestinationID:       row.DestinationID,
+			DeliveryStatus:      row.DeliveryStatus,
+			DeliveryError:       row.DeliveryError,
 			DispatchedAt:        time.Unix(row.DispatchedAt, 0).UTC(),
 			RawNotificationJSON: append([]byte(nil), row.RawNotificationJson...),
 			ClassifiedEventJSON: append([]byte(nil), row.ClassifiedEventJson...),
@@ -341,10 +426,52 @@ func (s *Store) ListAlertHistory(ctx context.Context, since time.Time, limit int
 
 // PruneAlertHistory removes records older than before.
 func (s *Store) PruneAlertHistory(ctx context.Context, before time.Time) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
 	if err := s.queries.DeleteAlertHistoryBefore(ctx, before.Unix()); err != nil {
 		return fmt.Errorf("delete expired alert history: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) validateContext(ctx context.Context) error {
+	if s == nil || s.db == nil || s.queries == nil {
+		return errors.New("notification store is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("notification store context is required")
+	}
+	return ctx.Err()
+}
+
+func (s *Store) admitTransaction(ctx context.Context, admission *notificationstate.Admission, cursorJSON []byte, pendingData *encodedPending) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin notification admission: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	queries := s.queries.WithTx(tx)
+	result, err := queries.MarkSeen(ctx, admission.NotificationID)
+	if err != nil {
+		return false, fmt.Errorf("mark notification seen during admission: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect notification admission: %w", err)
+	}
+	if rows == 1 && admission.Pending != nil {
+		if err := insertPending(ctx, queries, admission.Pending, pendingData); err != nil {
+			return false, fmt.Errorf("store pending notification: %w", err)
+		}
+	}
+	if err := queries.SaveCursor(ctx, gen.SaveCursorParams{CorporationID: admission.CorporationID, StateJson: cursorJSON}); err != nil {
+		return false, fmt.Errorf("save notification cursor with admission: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit notification admission: %w", err)
+	}
+	return rows == 1 && admission.Pending != nil, nil
 }
 
 func validatePending(pending *notificationstate.PendingNotification) error {

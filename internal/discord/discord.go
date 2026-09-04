@@ -14,17 +14,16 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
 const (
 	defaultWebhookTimeout = 15 * time.Second
-	webhookMaxAttempts    = 3
 	maxErrorBodyBytes     = 4096
 	maxPayloadBytes       = 64 << 10
-	webhookRetryDelay     = 500 * time.Millisecond
-	webhookRetryBuffer    = 100 * time.Millisecond
+	defaultRetryDelay     = 500 * time.Millisecond
 	maxWebhookRetryDelay  = 30 * time.Minute
 	maxContentCharacters  = 2000
 	maxEmbedCount         = 10
@@ -99,9 +98,37 @@ type Delivery interface {
 // WebhookDelivery sends messages through Discord webhooks.
 type WebhookDelivery struct {
 	client      *http.Client
-	maxTry      int
 	validateURL func(string) error
 	logger      *slog.Logger
+	gateMu      sync.Mutex
+	cooldowns   *webhookCooldowns
+}
+
+// RetryableError reports a Discord response that should be retried later.
+// The caller owns retry scheduling; Deliver never sleeps for this delay.
+type RetryableError struct {
+	StatusCode int
+	Delay      time.Duration
+	Err        error
+}
+
+// Error describes the retryable Discord response without exposing response data.
+func (e *RetryableError) Error() string {
+	if e == nil {
+		return "Discord delivery is retryable"
+	}
+	if e.StatusCode == 0 {
+		return "Discord webhook request failed; retryable"
+	}
+	return fmt.Sprintf("Discord webhook returned retryable status %d", e.StatusCode)
+}
+
+// Unwrap returns the safe underlying transport error when one exists.
+func (e *RetryableError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // WebhookOption customizes webhook delivery diagnostics.
@@ -145,9 +172,9 @@ func NewWebhookDelivery(client *http.Client, options ...WebhookOption) *WebhookD
 	}
 	delivery := &WebhookDelivery{
 		client:      &safeClient,
-		maxTry:      webhookMaxAttempts,
 		validateURL: ValidateWebhookURL,
 		logger:      slog.Default(),
+		cooldowns:   newWebhookCooldowns(),
 	}
 	for _, option := range options {
 		if option != nil {
@@ -242,8 +269,15 @@ func validateField(field Field) error {
 	return nil
 }
 
-// Deliver posts one embed message and retries only rate limits and server errors.
+// Deliver posts one embed message. Rate limits and server errors return a
+// RetryableError for the caller's durable retry queue instead of sleeping.
 func (d *WebhookDelivery) Deliver(ctx context.Context, destination Destination, message *Message) error {
+	if d == nil {
+		return errors.New("discord webhook delivery is required")
+	}
+	if ctx == nil {
+		return errors.New("discord delivery context is required")
+	}
 	validateURL := d.validateURL
 	if validateURL == nil {
 		validateURL = ValidateWebhookURL
@@ -254,7 +288,7 @@ func (d *WebhookDelivery) Deliver(ctx context.Context, destination Destination, 
 	if err := message.Validate(); err != nil {
 		return err
 	}
-	message.AllowedMentions = AllowedMentions{Parse: []string{}}
+	ensureMentionPolicy(message)
 	body, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("encode Discord message: %w", err)
@@ -266,104 +300,85 @@ func (d *WebhookDelivery) Deliver(ctx context.Context, destination Destination, 
 	if destinationID == "" {
 		destinationID = "unnamed"
 	}
-	d.logger.Debug("Discord webhook delivery started",
+	logger := d.deliveryLogger()
+	logger.Debug("Discord webhook delivery started",
 		"destination_id", destinationID,
 		"payload_bytes", len(body),
 		"embed_count", len(message.Embeds),
 	)
-	return d.deliverAttempts(ctx, destination, body, destinationID)
-}
-
-func (d *WebhookDelivery) deliverAttempts(ctx context.Context, destination Destination, body []byte, destinationID string) error {
-	deliveryStartedAt := time.Now()
-	for attempt := 1; attempt <= d.maxTry; attempt++ {
-		shouldRetry, err := d.deliverAttempt(ctx, destination, body, destinationID, attempt, deliveryStartedAt)
-		if err != nil {
-			return err
-		}
-		if !shouldRetry {
-			return nil
-		}
+	webhookKey := strings.TrimRight(strings.TrimSpace(destination.WebhookURL), "/")
+	if cooldown := d.webhookCooldowns().remaining(webhookKey); cooldown > 0 {
+		logger.Warn("Discord webhook delivery deferred by Discord cooldown",
+			"destination_id", destinationID,
+			"delay", cooldown,
+		)
+		return &RetryableError{StatusCode: http.StatusTooManyRequests, Delay: cooldown}
 	}
-	d.logger.Warn("Discord webhook delivery exhausted retries",
-		"destination_id", destinationID,
-		"attempts", d.maxTry,
-	)
-	return errors.New("discord delivery exhausted retries")
-}
 
-func (d *WebhookDelivery) deliverAttempt(
-	ctx context.Context,
-	destination Destination,
-	body []byte,
-	destinationID string,
-	attempt int,
-	deliveryStartedAt time.Time,
-) (bool, error) {
+	deliveryStartedAt := time.Now()
 	attemptStartedAt := time.Now()
 	response, err := d.post(ctx, destination.WebhookURL, body)
 	if err != nil {
-		d.logger.Debug("Discord webhook attempt failed",
-			"destination_id", destinationID,
-			"attempt", attempt,
-			"duration", time.Since(attemptStartedAt),
-			"err", err,
-		)
-		return false, err
+		return d.handleRequestError(logger, destinationID, attemptStartedAt, err)
 	}
 	responseRetryAfter := retryAfterResponse(response)
-	d.logAttempt(response, responseRetryAfter, destinationID, attempt, attemptStartedAt)
+	d.logAttempt(response, responseRetryAfter, destinationID, attemptStartedAt)
 	if response.statusCode >= http.StatusOK && response.statusCode < http.StatusMultipleChoices {
-		d.logDeliveryCompleted(destinationID, attempt, deliveryStartedAt)
-		return false, nil
+		d.logDeliveryCompleted(destinationID, deliveryStartedAt)
+		return nil
 	}
-	if !d.retryable(response.statusCode, attempt) {
-		if response.statusCode == http.StatusTooManyRequests || response.statusCode >= http.StatusInternalServerError {
-			d.logger.Warn("Discord webhook delivery exhausted retries",
-				"destination_id", destinationID,
-				"attempts", attempt,
-				"status_code", response.statusCode,
-			)
-			return false, errors.New("discord delivery exhausted retries")
-		}
-		d.logger.Warn("Discord webhook delivery failed",
+	if response.statusCode == http.StatusTooManyRequests || response.statusCode >= http.StatusInternalServerError {
+		delay := retryDelay(response)
+		d.webhookCooldowns().set(webhookKey, delay)
+		logger.Warn("Discord webhook delivery queued for retry",
 			"destination_id", destinationID,
-			"attempt", attempt,
+			"delay", delay,
 			"status_code", response.statusCode,
 		)
-		return false, fmt.Errorf("discord webhook returned status %d", response.statusCode)
+		return &RetryableError{StatusCode: response.statusCode, Delay: delay}
 	}
-	delay := deliveryRetryDelay(attempt, response)
-	d.logger.Warn("Discord webhook retry scheduled",
+	logger.Warn("Discord webhook delivery failed",
 		"destination_id", destinationID,
-		"attempt", attempt,
-		"next_attempt", attempt+1,
-		"delay", delay,
-		"retry_after", responseRetryAfter,
+		"attempt", 1,
+		"status_code", response.statusCode,
 	)
-	if err := wait(ctx, delay); err != nil {
-		d.logger.Warn("Discord webhook retry interrupted",
-			"destination_id", destinationID,
-			"attempt", attempt,
-			"err", err,
-		)
-		return false, err
-	}
-	d.logger.Debug("Discord webhook retry attempt starting",
-		"destination_id", destinationID,
-		"attempt", attempt+1,
-	)
-	return true, nil
+	return fmt.Errorf("discord webhook returned status %d", response.statusCode)
 }
 
-func (d *WebhookDelivery) logAttempt(response webhookResponse, responseRetryAfter time.Duration, destinationID string, attempt int, attemptStartedAt time.Time) {
-	logAttempt := d.logger.Debug
+func ensureMentionPolicy(message *Message) {
+	if message == nil || message.AllowedMentions.Parse != nil {
+		return
+	}
+	message.AllowedMentions.Parse = []string{}
+}
+
+func (d *WebhookDelivery) handleRequestError(logger *slog.Logger, destinationID string, startedAt time.Time, err error) error {
+	if errors.Is(err, context.Canceled) {
+		logger.Warn("Discord webhook attempt canceled",
+			"destination_id", destinationID,
+			"attempt", 1,
+			"duration", time.Since(startedAt),
+			"err", err,
+		)
+		return err
+	}
+	logger.Warn("Discord webhook attempt failed; retry scheduled",
+		"destination_id", destinationID,
+		"attempt", 1,
+		"duration", time.Since(startedAt),
+		"err", err,
+	)
+	return &RetryableError{Delay: defaultRetryDelay, Err: err}
+}
+
+func (d *WebhookDelivery) logAttempt(response webhookResponse, responseRetryAfter time.Duration, destinationID string, attemptStartedAt time.Time) {
+	logAttempt := d.deliveryLogger().Debug
 	if response.statusCode == http.StatusTooManyRequests || response.statusCode >= http.StatusInternalServerError {
-		logAttempt = d.logger.Warn
+		logAttempt = d.deliveryLogger().Warn
 	}
 	logAttempt("Discord webhook attempt completed",
 		"destination_id", destinationID,
-		"attempt", attempt,
+		"attempt", 1,
 		"status_code", response.statusCode,
 		"response_bytes", len(response.body),
 		"duration", time.Since(attemptStartedAt),
@@ -371,19 +386,12 @@ func (d *WebhookDelivery) logAttempt(response webhookResponse, responseRetryAfte
 	)
 }
 
-func (d *WebhookDelivery) logDeliveryCompleted(destinationID string, attempt int, deliveryStartedAt time.Time) {
-	d.logger.Debug("Discord webhook delivery completed",
+func (d *WebhookDelivery) logDeliveryCompleted(destinationID string, deliveryStartedAt time.Time) {
+	d.deliveryLogger().Debug("Discord webhook delivery completed",
 		"destination_id", destinationID,
-		"attempts", attempt,
+		"attempts", 1,
 		"duration", time.Since(deliveryStartedAt),
 	)
-	if attempt > 1 {
-		d.logger.Info("Discord webhook delivery recovered after retry",
-			"destination_id", destinationID,
-			"attempt", attempt,
-			"duration", time.Since(deliveryStartedAt),
-		)
-	}
 }
 
 // ValidateWebhookURL checks that raw is a trusted Discord webhook URL.
@@ -414,29 +422,10 @@ func validWebhookPath(path string) bool {
 	return len(parts) == 4 && parts[0] == "api" && parts[1] == "webhooks" && parts[2] != "" && parts[3] != ""
 }
 
-func (d *WebhookDelivery) retryable(statusCode, attempt int) bool {
-	return (statusCode == http.StatusTooManyRequests || statusCode >= 500) && attempt < d.maxTry
-}
-
-func wait(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func deliveryRetryDelay(attempt int, response webhookResponse) time.Duration {
+func retryDelay(response webhookResponse) time.Duration {
 	delay := retryAfterResponse(response)
 	if delay <= 0 {
-		delay = time.Duration(attempt) * webhookRetryDelay
-	}
-	delay = min(delay, maxWebhookRetryDelay)
-	if delay < maxWebhookRetryDelay {
-		delay += webhookRetryBuffer
+		delay = defaultRetryDelay
 	}
 	return min(delay, maxWebhookRetryDelay)
 }
@@ -464,7 +453,7 @@ func (d *WebhookDelivery) post(ctx context.Context, webhookURL string, body []by
 		return webhookResponse{}, &webhookRequestError{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := d.client.Do(req)
+	resp, err := d.httpClient().Do(req)
 	if err != nil {
 		return webhookResponse{}, &webhookRequestError{err: err}
 	}
@@ -477,6 +466,29 @@ func (d *WebhookDelivery) post(ctx context.Context, webhookURL string, body []by
 		return webhookResponse{}, &webhookRequestError{err: closeErr}
 	}
 	return webhookResponse{statusCode: resp.StatusCode, headers: resp.Header, body: responseBody}, nil
+}
+
+func (d *WebhookDelivery) deliveryLogger() *slog.Logger {
+	if d != nil && d.logger != nil {
+		return d.logger
+	}
+	return slog.Default()
+}
+
+func (d *WebhookDelivery) httpClient() *http.Client {
+	if d != nil && d.client != nil {
+		return d.client
+	}
+	return &http.Client{Timeout: defaultWebhookTimeout}
+}
+
+func (d *WebhookDelivery) webhookCooldowns() *webhookCooldowns {
+	d.gateMu.Lock()
+	defer d.gateMu.Unlock()
+	if d.cooldowns == nil {
+		d.cooldowns = newWebhookCooldowns()
+	}
+	return d.cooldowns
 }
 
 func retryAfter(value string) time.Duration {

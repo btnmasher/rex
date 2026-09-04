@@ -51,12 +51,14 @@ insert into alert_history (
   corporation_ticker,
   character_id,
   destination_id,
+  delivery_status,
+  delivery_error,
   dispatched_at,
   raw_notification_json,
   classified_event_json,
   discord_payload_json
 )
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertAlertHistoryParams struct {
@@ -68,6 +70,8 @@ type InsertAlertHistoryParams struct {
 	CorporationTicker   string `json:"corporation_ticker"`
 	CharacterID         string `json:"character_id"`
 	DestinationID       string `json:"destination_id"`
+	DeliveryStatus      string `json:"delivery_status"`
+	DeliveryError       string `json:"delivery_error"`
 	DispatchedAt        int64  `json:"dispatched_at"`
 	RawNotificationJson []byte `json:"raw_notification_json"`
 	ClassifiedEventJson []byte `json:"classified_event_json"`
@@ -84,6 +88,8 @@ func (q *Queries) InsertAlertHistory(ctx context.Context, arg InsertAlertHistory
 		arg.CorporationTicker,
 		arg.CharacterID,
 		arg.DestinationID,
+		arg.DeliveryStatus,
+		arg.DeliveryError,
 		arg.DispatchedAt,
 		arg.RawNotificationJson,
 		arg.ClassifiedEventJson,
@@ -100,6 +106,8 @@ insert into notification_retries (
   corporation_ticker,
   character_id,
   notification_json,
+  destination_ids_json,
+  delivered_destination_ids_json,
   failed_destination_ids_json,
   attempts,
   created_at,
@@ -107,22 +115,24 @@ insert into notification_retries (
   last_error,
   updated_at
 )
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
 on conflict(notification_id) do nothing
 `
 
 type InsertPendingParams struct {
-	NotificationID           int64  `json:"notification_id"`
-	CorporationID            string `json:"corporation_id"`
-	CorporationName          string `json:"corporation_name"`
-	CorporationTicker        string `json:"corporation_ticker"`
-	CharacterID              string `json:"character_id"`
-	NotificationJson         []byte `json:"notification_json"`
-	FailedDestinationIdsJson []byte `json:"failed_destination_ids_json"`
-	Attempts                 int64  `json:"attempts"`
-	CreatedAt                int64  `json:"created_at"`
-	NextRetryAt              int64  `json:"next_retry_at"`
-	LastError                string `json:"last_error"`
+	NotificationID              int64  `json:"notification_id"`
+	CorporationID               string `json:"corporation_id"`
+	CorporationName             string `json:"corporation_name"`
+	CorporationTicker           string `json:"corporation_ticker"`
+	CharacterID                 string `json:"character_id"`
+	NotificationJson            []byte `json:"notification_json"`
+	DestinationIdsJson          []byte `json:"destination_ids_json"`
+	DeliveredDestinationIdsJson []byte `json:"delivered_destination_ids_json"`
+	FailedDestinationIdsJson    []byte `json:"failed_destination_ids_json"`
+	Attempts                    int64  `json:"attempts"`
+	CreatedAt                   int64  `json:"created_at"`
+	NextRetryAt                 int64  `json:"next_retry_at"`
+	LastError                   string `json:"last_error"`
 }
 
 func (q *Queries) InsertPending(ctx context.Context, arg InsertPendingParams) error {
@@ -133,6 +143,8 @@ func (q *Queries) InsertPending(ctx context.Context, arg InsertPendingParams) er
 		arg.CorporationTicker,
 		arg.CharacterID,
 		arg.NotificationJson,
+		arg.DestinationIdsJson,
+		arg.DeliveredDestinationIdsJson,
 		arg.FailedDestinationIdsJson,
 		arg.Attempts,
 		arg.CreatedAt,
@@ -145,7 +157,7 @@ func (q *Queries) InsertPending(ctx context.Context, arg InsertPendingParams) er
 const listAlertHistory = `-- name: ListAlertHistory :many
 select id, notification_id, notification_type, alert_type,
        corporation_id, corporation_name, corporation_ticker, character_id,
-       destination_id, dispatched_at, raw_notification_json,
+       destination_id, delivery_status, delivery_error, dispatched_at, raw_notification_json,
        classified_event_json, discord_payload_json
 from alert_history
 where dispatched_at >= ?
@@ -177,6 +189,8 @@ func (q *Queries) ListAlertHistory(ctx context.Context, arg ListAlertHistoryPara
 			&i.CorporationTicker,
 			&i.CharacterID,
 			&i.DestinationID,
+			&i.DeliveryStatus,
+			&i.DeliveryError,
 			&i.DispatchedAt,
 			&i.RawNotificationJson,
 			&i.ClassifiedEventJson,
@@ -197,7 +211,8 @@ func (q *Queries) ListAlertHistory(ctx context.Context, arg ListAlertHistoryPara
 
 const listPending = `-- name: ListPending :many
 select notification_id, corporation_id, corporation_name, corporation_ticker,
-       character_id, notification_json, failed_destination_ids_json, attempts,
+       character_id, notification_json, destination_ids_json,
+       delivered_destination_ids_json, failed_destination_ids_json, attempts,
        created_at, next_retry_at, last_error
 from notification_retries
 where next_retry_at <= ?
@@ -211,17 +226,19 @@ type ListPendingParams struct {
 }
 
 type ListPendingRow struct {
-	NotificationID           int64  `json:"notification_id"`
-	CorporationID            string `json:"corporation_id"`
-	CorporationName          string `json:"corporation_name"`
-	CorporationTicker        string `json:"corporation_ticker"`
-	CharacterID              string `json:"character_id"`
-	NotificationJson         []byte `json:"notification_json"`
-	FailedDestinationIdsJson []byte `json:"failed_destination_ids_json"`
-	Attempts                 int64  `json:"attempts"`
-	CreatedAt                int64  `json:"created_at"`
-	NextRetryAt              int64  `json:"next_retry_at"`
-	LastError                string `json:"last_error"`
+	NotificationID              int64  `json:"notification_id"`
+	CorporationID               string `json:"corporation_id"`
+	CorporationName             string `json:"corporation_name"`
+	CorporationTicker           string `json:"corporation_ticker"`
+	CharacterID                 string `json:"character_id"`
+	NotificationJson            []byte `json:"notification_json"`
+	DestinationIdsJson          []byte `json:"destination_ids_json"`
+	DeliveredDestinationIdsJson []byte `json:"delivered_destination_ids_json"`
+	FailedDestinationIdsJson    []byte `json:"failed_destination_ids_json"`
+	Attempts                    int64  `json:"attempts"`
+	CreatedAt                   int64  `json:"created_at"`
+	NextRetryAt                 int64  `json:"next_retry_at"`
+	LastError                   string `json:"last_error"`
 }
 
 func (q *Queries) ListPending(ctx context.Context, arg ListPendingParams) ([]ListPendingRow, error) {
@@ -240,6 +257,8 @@ func (q *Queries) ListPending(ctx context.Context, arg ListPendingParams) ([]Lis
 			&i.CorporationTicker,
 			&i.CharacterID,
 			&i.NotificationJson,
+			&i.DestinationIdsJson,
+			&i.DeliveredDestinationIdsJson,
 			&i.FailedDestinationIdsJson,
 			&i.Attempts,
 			&i.CreatedAt,
@@ -285,21 +304,23 @@ func (q *Queries) PruneSeen(ctx context.Context, seenAt int64) error {
 
 const reschedulePending = `-- name: ReschedulePending :execrows
 update notification_retries
-set failed_destination_ids_json = ?, attempts = ?, next_retry_at = ?,
+set delivered_destination_ids_json = ?, failed_destination_ids_json = ?, attempts = ?, next_retry_at = ?,
     last_error = ?, updated_at = unixepoch()
 where notification_id = ?
 `
 
 type ReschedulePendingParams struct {
-	FailedDestinationIdsJson []byte `json:"failed_destination_ids_json"`
-	Attempts                 int64  `json:"attempts"`
-	NextRetryAt              int64  `json:"next_retry_at"`
-	LastError                string `json:"last_error"`
-	NotificationID           int64  `json:"notification_id"`
+	DeliveredDestinationIdsJson []byte `json:"delivered_destination_ids_json"`
+	FailedDestinationIdsJson    []byte `json:"failed_destination_ids_json"`
+	Attempts                    int64  `json:"attempts"`
+	NextRetryAt                 int64  `json:"next_retry_at"`
+	LastError                   string `json:"last_error"`
+	NotificationID              int64  `json:"notification_id"`
 }
 
 func (q *Queries) ReschedulePending(ctx context.Context, arg ReschedulePendingParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, reschedulePending,
+		arg.DeliveredDestinationIdsJson,
 		arg.FailedDestinationIdsJson,
 		arg.Attempts,
 		arg.NextRetryAt,

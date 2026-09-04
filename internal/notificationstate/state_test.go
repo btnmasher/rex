@@ -29,7 +29,7 @@ func TestMemoryStoreRejectsInvalidPendingReschedule(t *testing.T) {
 		NotificationJSON: []byte(`{"type":"StructureUnderAttack"}`),
 		NextRetryAt:      time.Now().UTC().Add(time.Minute),
 	}
-	if claimed, err := store.ClaimPending(context.Background(), pending); err != nil || !claimed {
+	if claimed, err := store.Admit(context.Background(), &Admission{NotificationID: pending.NotificationID, CorporationID: pending.CorporationID, Pending: pending}); err != nil || !claimed {
 		t.Fatalf("claim pending: claimed=%t err=%v", claimed, err)
 	}
 	pending.NotificationJSON = nil

@@ -23,7 +23,9 @@ import (
 	"github.com/btnmasher/rex/internal/alerts"
 	"github.com/btnmasher/rex/internal/authnextdb"
 	"github.com/btnmasher/rex/internal/config"
+	"github.com/btnmasher/rex/internal/delivery"
 	"github.com/btnmasher/rex/internal/discord"
+	"github.com/btnmasher/rex/internal/enrichment"
 	"github.com/btnmasher/rex/internal/esi"
 	"github.com/btnmasher/rex/internal/logging"
 	notificationstatesqlite "github.com/btnmasher/rex/internal/notificationstate/sqlite"
@@ -38,8 +40,20 @@ const (
 	notificationConcurrency    = 8
 	tokenRefreshConcurrency    = 8
 	tokenRefreshStartupTimeout = 2 * time.Minute
-	jobWorkerCount             = 2
+	jobWorkerCount             = 3
 )
+
+type application struct {
+	notificationPoller   *poller.Poller
+	notificationDelivery *delivery.Worker
+	tokenRefreshJob      *tokenrefresh.Job
+	logger               *slog.Logger
+}
+
+type notificationAdmission struct {
+	delivery.Enqueuer
+	poller.PreRouter
+}
 
 func main() {
 	if len(os.Args) > 1 {
@@ -108,11 +122,11 @@ func run() error {
 	defer func() { _ = notificationStateStore.Close() }()
 	logger.Info("notification state store configured", "path", cfg.NotificationStateSQLitePath)
 
-	notificationPoller, tokenRefreshJob, err := newNotificationPoller(appContext, &cfg, pool, jobStore, notificationStateStore, logger)
+	app, err := newApplication(appContext, &cfg, pool, jobStore, notificationStateStore, logger)
 	if err != nil {
 		return err
 	}
-	return runJobs(appContext, notificationPoller, tokenRefreshJob, logger)
+	return app.run(appContext)
 }
 
 func newDatabase(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
@@ -132,27 +146,38 @@ func newDatabase(ctx context.Context, databaseURL string) (*pgxpool.Pool, error)
 	return pool, nil
 }
 
-func newNotificationPoller(
+func newApplication(
 	ctx context.Context,
 	cfg *config.Config,
 	pool *pgxpool.Pool,
 	jobStore jobstore.Store,
 	notificationStateStore *notificationstatesqlite.Store,
 	logger *slog.Logger,
-) (*poller.Poller, *tokenrefresh.Job, error) {
+) (*application, error) {
+	if ctx == nil || cfg == nil || pool == nil || jobStore == nil || notificationStateStore == nil {
+		return nil, errors.New("application dependencies are required")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
 	database := authnextdb.New(pool)
 	httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
-	tokenExportClient, err := tokenexport.NewClient(cfg.AuthNextTokenExportBaseURL, cfg.AuthNextTokenExportBearerToken, httpClient)
+	tokenExportClient, err := tokenexport.NewClient(tokenexport.ClientConfig{
+		BaseURL:     cfg.AuthNextTokenExportBaseURL,
+		BearerToken: cfg.AuthNextTokenExportBearerToken,
+		TokenCount:  cfg.AuthNextTokenExportCount,
+		HTTPClient:  httpClient,
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	tokens, err := token.NewProvider(tokenExportClient)
+	tokens, err := token.NewProvider(tokenExportClient, cfg.PollInterval)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	refreshJob, err := tokenrefresh.New(jobStore, tokenExportClient, tokens, tokenRefreshConcurrency, logger)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	startupContext, cancelStartup := context.WithTimeout(ctx, tokenRefreshStartupTimeout)
 	refreshStartedAt := time.Now()
@@ -181,37 +206,45 @@ func newNotificationPoller(
 		esi.WithLogger(logger),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	universeResolver := universe.NewResolverWithLogger(database, esiClient, logger)
-	delivery := discord.NewWebhookDelivery(httpClient, discord.WithLogger(logger))
-	destinations := make([]alerts.Destination, 0, len(cfg.AlertDestinations))
-	for i := range cfg.AlertDestinations {
-		destination := &cfg.AlertDestinations[i]
-		destinations = append(destinations, alerts.Destination{
-			ID:                      destination.Name,
-			WebhookURLs:             destination.WebhookURLs,
-			AlertTypes:              destination.AlertTypes,
-			ExcludeAlertTypes:       destination.ExcludeAlertTypes,
-			ExcludeStructureTypeIDs: destination.ExcludeStructureTypeIDs,
-			IncludeCorporationIDs:   destination.IncludeCorporationIDs,
-			ExcludeCorporationIDs:   destination.ExcludeCorporationIDs,
-		})
+	discordDelivery := discord.NewWebhookDelivery(httpClient, discord.WithLogger(logger))
+	enrichmentService := enrichment.NewService(database, universeResolver, logger)
+	destinations, err := alerts.DestinationsFromConfig(cfg.AlertDestinations)
+	if err != nil {
+		return nil, err
 	}
-	alertService, err := alerts.NewService(database, delivery, &alerts.Config{
-		Destinations:            destinations,
-		OverrideSenderName:      cfg.DiscordOverrideSenderName,
-		OverrideSenderAvatarURL: cfg.DiscordOverrideSenderAvatarURL,
-		ShowEntityIDs:           cfg.DiscordShowEntityIDs,
-		LogPayloads:             cfg.LogPayloads,
-		Logger:                  logger,
-		UniverseResolver:        universeResolver,
-		History:                 notificationStateStore,
+	alertService, err := alerts.NewService(database, discordDelivery, &alerts.Config{
+		Destinations: destinations,
+		Enricher:     enrichmentService,
+		LogPayloads:  cfg.LogPayloads,
+		Logger:       logger,
+		History:      notificationStateStore,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	notificationPoller, err := poller.NewWithConfig(database, tokens, esiClient, alertService, poller.Config{
+	discordAdapter, err := alerts.NewDiscordAdapter(alertService)
+	if err != nil {
+		return nil, err
+	}
+	notificationDelivery, err := delivery.New(&delivery.Config{
+		Store:          notificationStateStore,
+		Enricher:       enrichmentService,
+		Router:         alertService,
+		Adapter:        discordAdapter,
+		TerminalRecord: alertService,
+		Concurrency:    notificationConcurrency,
+		Logger:         logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	notificationPoller, err := poller.NewWithConfig(database, tokens, esiClient, notificationAdmission{
+		Enqueuer:  notificationDelivery,
+		PreRouter: alertService,
+	}, poller.Config{
 		Interval:    cfg.PollInterval,
 		Lookbehind:  cfg.PollLookbehind,
 		Concurrency: notificationConcurrency,
@@ -219,23 +252,28 @@ func newNotificationPoller(
 		StateStore:  notificationStateStore,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return notificationPoller, refreshJob, nil
+	return &application{
+		notificationPoller:   notificationPoller,
+		notificationDelivery: notificationDelivery,
+		tokenRefreshJob:      refreshJob,
+		logger:               logger,
+	}, nil
 }
 
-func runJobs(
-	ctx context.Context,
-	notificationPoller *poller.Poller,
-	tokenRefreshJob *tokenrefresh.Job,
-	logger *slog.Logger,
-) error {
-	if notificationPoller == nil || tokenRefreshJob == nil {
-		return errors.New("job workers are required")
+func (a *application) run(ctx context.Context) error {
+	if a == nil || a.notificationPoller == nil || a.notificationDelivery == nil || a.tokenRefreshJob == nil {
+		return errors.New("application workers are required")
 	}
+	if ctx == nil {
+		return errors.New("application context is required")
+	}
+	logger := a.logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+
 	jobContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -246,9 +284,9 @@ func runJobs(
 		defer workers.Done()
 		workerErrors <- runWorkerSafely(logger, "notification poller", func() error {
 			select {
-			case <-tokenRefreshJob.Ready():
+			case <-a.tokenRefreshJob.Ready():
 				logger.Info("access tokens available; starting notification poller")
-				return notificationPoller.Run(jobContext)
+				return a.notificationPoller.Run(jobContext)
 			case <-jobContext.Done():
 				return jobContext.Err()
 			}
@@ -256,8 +294,14 @@ func runJobs(
 	}()
 	go func() {
 		defer workers.Done()
+		workerErrors <- runWorkerSafely(logger, "notification delivery worker", func() error {
+			return a.notificationDelivery.Run(jobContext)
+		})
+	}()
+	go func() {
+		defer workers.Done()
 		workerErrors <- runWorkerSafely(logger, "access-token refresh scheduler", func() error {
-			return tokenRefreshJob.RunPeriodically(jobContext)
+			return a.tokenRefreshJob.RunPeriodically(jobContext)
 		})
 	}()
 

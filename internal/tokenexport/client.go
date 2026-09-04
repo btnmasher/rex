@@ -10,31 +10,30 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 const (
 	exportPath        = "/api/internal/member-refresh-tokens"
 	corporationsPath  = exportPath + "/corporations"
 	maxResponseBytes  = 2 << 20
-	maxTokensPerCorp  = 15
 	maxRequestedCorps = 100
 	maxEligibleCorps  = 1000
 )
+
+// MaxTokensPerCorporation is the maximum number of token records accepted from
+// one corporation export response.
+const MaxTokensPerCorporation = 64
 
 var corporationIDPattern = regexp.MustCompile(`^\d+$`)
 
 // AccessTokenRecord is one EVE access token returned by auth-next.
 type AccessTokenRecord struct {
-	CharacterID   string    `json:"characterId"`
-	CharacterName string    `json:"characterName"`
-	UserID        uuid.UUID `json:"userId"`
-	Role          string    `json:"role"`
-	AccessToken   string    `json:"accessToken"`
-	ExpiresAt     time.Time `json:"expiresAt"`
+	CharacterID string    `json:"characterId"`
+	AccessToken string    `json:"accessToken"`
+	ExpiresAt   time.Time `json:"expiresAt"`
 }
 
 // CorporationListResponse is the validated list returned by auth-next.
@@ -62,33 +61,51 @@ type Response struct {
 	RequestedCorporationIDs []string                `json:"requestedCorporationIds"`
 }
 
+// ClientConfig contains the validated settings for an auth-next token export
+// client.
+type ClientConfig struct {
+	BaseURL     string
+	BearerToken string
+	TokenCount  int
+	HTTPClient  *http.Client
+}
+
 // Client calls auth-next without exposing bearer credentials to callers.
 type Client struct {
 	baseURL     *url.URL
 	bearerToken string
 	httpClient  *http.Client
+	tokenCount  int
 }
 
 // NewClient creates a token-export client for an explicit auth-next base URL.
-func NewClient(baseURL, bearerToken string, httpClient *http.Client) (*Client, error) {
-	if strings.TrimSpace(baseURL) == "" {
+func NewClient(config ClientConfig) (*Client, error) {
+	if strings.TrimSpace(config.BaseURL) == "" {
 		return nil, errors.New("auth-next token export base URL is required")
 	}
-	if strings.TrimSpace(bearerToken) == "" {
+	if strings.TrimSpace(config.BearerToken) == "" {
 		return nil, errors.New("auth-next token export bearer token is required")
 	}
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if config.TokenCount < 1 || config.TokenCount > MaxTokensPerCorporation {
+		return nil, fmt.Errorf("auth-next token export count must be between 1 and %d", MaxTokensPerCorporation)
+	}
+	parsed, err := url.Parse(strings.TrimSpace(config.BaseURL))
 	if err != nil {
-		return nil, fmt.Errorf("invalid auth-next token export base URL %q", baseURL)
+		return nil, fmt.Errorf("invalid auth-next token export base URL %q", config.BaseURL)
 	}
 	validScheme := parsed.Scheme == "http" || parsed.Scheme == "https"
 	if !validScheme || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, fmt.Errorf("invalid auth-next token export base URL %q", baseURL)
+		return nil, fmt.Errorf("invalid auth-next token export base URL %q", config.BaseURL)
 	}
-	if httpClient == nil {
-		httpClient = &http.Client{}
+	if config.HTTPClient == nil {
+		config.HTTPClient = &http.Client{}
 	}
-	return &Client{baseURL: parsed, bearerToken: bearerToken, httpClient: httpClient}, nil
+	return &Client{
+		baseURL:     parsed,
+		bearerToken: config.BearerToken,
+		httpClient:  config.HTTPClient,
+		tokenCount:  config.TokenCount,
+	}, nil
 }
 
 // ListCorporations retrieves the active member and special-purpose corporations.
@@ -105,11 +122,15 @@ func (c *Client) ListCorporations(ctx context.Context) ([]string, error) {
 
 // FetchCorporation retrieves one corporation's token group.
 func (c *Client) FetchCorporation(ctx context.Context, corporationID string) (Response, error) {
+	if c == nil {
+		return Response{}, errors.New("token export client is unavailable")
+	}
 	if err := validateCorporationID(corporationID); err != nil {
 		return Response{}, err
 	}
 	query := url.Values{}
 	query.Set("corporationId", corporationID)
+	query.Set("count", strconv.Itoa(c.tokenCount))
 	var decoded Response
 	if err := c.getJSON(ctx, exportPath, query, &decoded); err != nil {
 		return Response{}, err
@@ -121,6 +142,12 @@ func (c *Client) FetchCorporation(ctx context.Context, corporationID string) (Re
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, query url.Values, target any) error {
+	if c == nil {
+		return errors.New("token export client is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("token export context is required")
+	}
 	requestURL := *c.baseURL
 	requestURL.Path = strings.TrimRight(c.baseURL.Path, "/") + path
 	if query != nil {
@@ -210,8 +237,8 @@ func validateGroup(group *CorporationTokenGroup, index int, seen map[string]stru
 	if group.CorporationName == "" {
 		return fmt.Errorf("%w: corporation %s has no name", ErrInvalidResponse, group.CorporationID)
 	}
-	if len(group.Tokens) > maxTokensPerCorp {
-		return fmt.Errorf("%w: corporation %s has more than %d tokens", ErrInvalidResponse, group.CorporationID, maxTokensPerCorp)
+	if len(group.Tokens) > MaxTokensPerCorporation {
+		return fmt.Errorf("%w: corporation %s has more than %d tokens", ErrInvalidResponse, group.CorporationID, MaxTokensPerCorporation)
 	}
 	if _, exists := seen[group.CorporationID]; exists {
 		return fmt.Errorf("%w: duplicate corporation %s", ErrInvalidResponse, group.CorporationID)
@@ -229,11 +256,8 @@ func validateToken(corporationID string, token *AccessTokenRecord, index int, se
 	if err := validateCorporationID(token.CharacterID); err != nil {
 		return fmt.Errorf("%w: corporation %s token %d: invalid character ID: %w", ErrInvalidResponse, corporationID, index, err)
 	}
-	if token.CharacterName == "" || token.UserID == uuid.Nil || token.AccessToken == "" || token.ExpiresAt.IsZero() {
+	if token.AccessToken == "" || token.ExpiresAt.IsZero() {
 		return fmt.Errorf("%w: corporation %s token %d is incomplete", ErrInvalidResponse, corporationID, index)
-	}
-	if token.Role != "member" && token.Role != "director" {
-		return fmt.Errorf("%w: corporation %s token %d has invalid role", ErrInvalidResponse, corporationID, index)
 	}
 	if _, exists := seen[token.CharacterID]; exists {
 		return fmt.Errorf("%w: corporation %s has duplicate character %s", ErrInvalidResponse, corporationID, token.CharacterID)

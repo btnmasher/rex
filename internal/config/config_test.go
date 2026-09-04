@@ -11,299 +11,143 @@ func setRequiredEnvironment(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/rex")
 	t.Setenv("AUTH_NEXT_TOKEN_EXPORT_BASE_URL", "http://localhost:3000")
 	t.Setenv("AUTH_NEXT_TOKEN_EXPORT_BEARER_TOKEN", "test-bearer")
+	t.Setenv("AUTH_NEXT_TOKEN_EXPORT_COUNT", "60")
 	t.Setenv("EVE_SSO_CLIENT_ID", "test-client")
-	writeDestinationsFile(t, `[{"name":"test-alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"]}]`)
+	writeDestinationsFile(t, "alert-destinations.json", `{"version":1,"destinations":[{"name":"test-alerts","filters":{"alertTypes":["all"]},"delivery":{"type":"discord","targets":[{"id":"primary","webhookUrl":"https://discord.com/api/webhooks/123/token"}]}}]}`)
 }
 
-func writeDestinationsFile(t *testing.T, contents string) {
+func writeDestinationsFile(t *testing.T, name, contents string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "alert-destinations.json")
+	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write destinations file: %v", err)
 	}
-	t.Setenv("ALERT_DESTINATIONS_FILE", path)
+	t.Setenv("ALERT_DESTINATIONS_CONFIG", path)
 }
 
 func TestLoadTokenExportConfiguration(t *testing.T) {
 	setRequiredEnvironment(t)
 
-	config, err := Load()
+	loaded, err := Load()
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if config.AuthNextTokenExportBaseURL != "http://localhost:3000" || config.AuthNextTokenExportBearerToken != "test-bearer" {
-		t.Fatalf("unexpected token export configuration: %#v", config)
+	if loaded.AuthNextTokenExportBaseURL != "http://localhost:3000" || loaded.AuthNextTokenExportBearerToken != "test-bearer" || loaded.AuthNextTokenExportCount != 60 {
+		t.Fatalf("unexpected token export configuration: %#v", loaded)
 	}
 }
 
-func TestLoadRejectsMissingTokenExportBearer(t *testing.T) {
+func TestLoadRejectsInvalidTokenExportCount(t *testing.T) {
 	setRequiredEnvironment(t)
-	t.Setenv("AUTH_NEXT_TOKEN_EXPORT_BEARER_TOKEN", "")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected missing bearer token error")
+	t.Setenv("AUTH_NEXT_TOKEN_EXPORT_COUNT", "65")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid token export count to fail")
 	}
 }
 
-func TestLoadAlertDestinations(t *testing.T) {
+func TestLoadAlertConfiguration(t *testing.T) {
 	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[
-		{"name":"structure-alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":[" structures.combat.under_attack ","sovereignty.events"]}
-	]`)
-	t.Setenv("DISCORD_OVERRIDE_SENDER_NAME", "Rex")
-	t.Setenv("DISCORD_OVERRIDE_SENDER_AVATAR_URL", "https://images.example.invalid/rex.png")
-	t.Setenv("LOG_PRETTY", "true")
-	t.Setenv("LOG_PAYLOADS", "true")
-	t.Setenv("NOTIFICATION_STATE_SQLITE_PATH", "/tmp/rex-state.sqlite")
-
-	config, err := Load()
+	writeDestinationsFile(t, "alert-destinations.yaml", `
+version: 1
+destinations:
+  # Comments are supported in YAML configuration.
+  - name: structure-alerts
+    filters:
+      alertTypes: [structures.state]
+      excludeAlertTypes: [structures.state.vulnerable]
+      includeCorporationIDs: ["000123456789"]
+    presentation:
+      showEntityIDs: true
+    delivery:
+      type: discord
+      targets:
+        - id: primary
+          webhookUrl: https://discord.com/api/webhooks/123/token
+      mentionRules:
+        - alertTypes: [structures.state]
+          mention: here
+`)
+	loaded, err := LoadAlertConfig()
 	if err != nil {
-		t.Fatalf("load config: %v", err)
+		t.Fatalf("load alert config: %v", err)
 	}
-	if len(config.AlertDestinations) != 1 {
-		t.Fatalf("unexpected destinations: %#v", config.AlertDestinations)
+	if loaded.AlertDestinationsConfig == "" || len(loaded.AlertDestinations) != 1 {
+		t.Fatalf("unexpected alert config: %#v", loaded)
 	}
-	destination := config.AlertDestinations[0]
-	if destination.Name != "structure-alerts" || len(destination.WebhookURLs) != 1 || destination.WebhookURLs[0] != "https://discord.com/api/webhooks/123/token" ||
-		len(destination.AlertTypes) != 2 || destination.AlertTypes[0] != "structures.combat.under_attack" || destination.AlertTypes[1] != "sovereignty.events" {
+	destination := loaded.AlertDestinations[0]
+	if destination.Name != "structure-alerts" || !destination.Presentation.ShowEntityIDs || destination.Delivery.Type != "discord" {
 		t.Fatalf("unexpected destination: %#v", destination)
 	}
-	if config.DiscordOverrideSenderName != "Rex" || config.DiscordOverrideSenderAvatarURL != "https://images.example.invalid/rex.png" {
-		t.Fatalf("unexpected Discord sender configuration: %#v", config)
-	}
-	if config.DiscordShowEntityIDs {
-		t.Fatal("expected entity IDs to be hidden by default")
-	}
-	if !config.LogPretty {
-		t.Fatal("expected pretty logging to be enabled")
-	}
-	if !config.LogPayloads {
-		t.Fatal("expected payload logging to be enabled")
-	}
-	if config.NotificationStateSQLitePath != "/tmp/rex-state.sqlite" {
-		t.Fatalf("unexpected notification state path: %q", config.NotificationStateSQLitePath)
+	if len(destination.Filters.AlertTypes) != 1 || destination.Filters.AlertTypes[0] != "structures.state" || destination.Filters.ExcludeAlertTypes[0] != "structures.state.vulnerable" {
+		t.Fatalf("unexpected filters: %#v", destination.Filters)
 	}
 }
 
-func TestLoadAlertDestinationSupportsMultipleWebhookURLs(t *testing.T) {
+func TestLoadRejectsUnsupportedConfigurationVersion(t *testing.T) {
 	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"structure-alerts","webhookUrls":["https://discord.com/api/webhooks/123/token-a","https://discord.com/api/webhooks/456/token-b"],"alertTypes":["structures.combat"]}]`)
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	destination := config.AlertDestinations[0]
-	if len(destination.WebhookURLs) != 2 || destination.WebhookURLs[0] != "https://discord.com/api/webhooks/123/token-a" || destination.WebhookURLs[1] != "https://discord.com/api/webhooks/456/token-b" {
-		t.Fatalf("unexpected webhook URLs: %#v", destination.WebhookURLs)
+	writeDestinationsFile(t, "alert-destinations.json", `{"version":2,"destinations":[]}`)
+	if _, err := LoadAlertConfig(); err == nil {
+		t.Fatal("expected unsupported version error")
 	}
 }
 
-func TestLoadAlertDestinationSupportsCorporationFilters(t *testing.T) {
+func TestLoadRejectsMissingConfigurationVersion(t *testing.T) {
 	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{
-		"name":"corporation-alerts",
-		"webhookUrls":["https://discord.com/api/webhooks/123/token"],
-		"alertTypes":["all"],
-		"includeCorporationIDs":[" 000123456789 "],
-		"excludeCorporationIDs":["987654321"]
-	}]`)
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	destination := config.AlertDestinations[0]
-	if len(destination.IncludeCorporationIDs) != 1 || destination.IncludeCorporationIDs[0] != "123456789" {
-		t.Fatalf("unexpected included corporation IDs: %#v", destination.IncludeCorporationIDs)
-	}
-	if len(destination.ExcludeCorporationIDs) != 1 || destination.ExcludeCorporationIDs[0] != "987654321" {
-		t.Fatalf("unexpected excluded corporation IDs: %#v", destination.ExcludeCorporationIDs)
+	writeDestinationsFile(t, "alert-destinations.json", `{"destinations":[]}`)
+	if _, err := LoadAlertConfig(); err == nil {
+		t.Fatal("expected missing version error")
 	}
 }
 
-func TestLoadRejectsInvalidCorporationFilter(t *testing.T) {
+func TestLoadRejectsUnknownConfigurationFields(t *testing.T) {
 	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"includeCorporationIDs":["not-a-corporation"]}]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected invalid corporation filter error")
+	writeDestinationsFile(t, "alert-destinations.json", `{"version":1,"destinations":[{"name":"alerts","filters":{"alertTypes":["all"]},"delivery":{"type":"discord","targets":[]},"legacy":true}]}`)
+	if _, err := LoadAlertConfig(); err == nil {
+		t.Fatal("expected unknown field error")
 	}
 }
 
-func TestLoadRejectsDuplicateCorporationFilter(t *testing.T) {
+func TestLoadRejectsEmptyDestinationFilters(t *testing.T) {
 	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"excludeCorporationIDs":["123","000123"]}]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected duplicate corporation filter error")
+	writeDestinationsFile(t, "alert-destinations.json", `{"version":1,"destinations":[{"name":"alerts","filters":{},"delivery":{"type":"discord","targets":[]}}]}`)
+	if _, err := LoadAlertConfig(); err == nil {
+		t.Fatal("expected empty filter error")
 	}
 }
 
-func TestLoadSupportsDiscordEntityIDVisibility(t *testing.T) {
+func TestLoadRejectsDuplicateDestinationNames(t *testing.T) {
 	setRequiredEnvironment(t)
-	t.Setenv("DISCORD_SHOW_ENTITY_IDS", "true")
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
+	writeDestinationsFile(t, "alert-destinations.json", `{"version":1,"destinations":[{"name":"alerts","filters":{"alertTypes":["all"]},"delivery":{"type":"discord","targets":[]}}, {"name":"alerts","filters":{"alertTypes":["all"]},"delivery":{"type":"discord","targets":[]}}]}`)
+	if _, err := LoadAlertConfig(); err == nil {
+		t.Fatal("expected duplicate destination name error")
 	}
-	if !config.DiscordShowEntityIDs {
-		t.Fatal("expected entity IDs to be enabled")
+}
+
+func TestLoadRejectsInvalidFilters(t *testing.T) {
+	setRequiredEnvironment(t)
+	writeDestinationsFile(t, "alert-destinations.json", `{"version":1,"destinations":[{"name":"alerts","filters":{"alertTypes":["all","structures"]},"delivery":{"type":"discord","targets":[]}}]}`)
+	if _, err := LoadAlertConfig(); err == nil {
+		t.Fatal("expected invalid filter error")
+	}
+}
+
+func TestLoadIgnoresRemovedEnvironmentVariables(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("ALERT_DESTINATIONS_FILE", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("DISCORD_SHOW_ENTITY_IDS", "invalid")
+	if _, err := LoadAlertConfig(); err != nil {
+		t.Fatalf("removed environment variables should be ignored: %v", err)
 	}
 }
 
 func TestLoadCapsPollLookbehind(t *testing.T) {
 	setRequiredEnvironment(t)
 	t.Setenv("POLL_LOOKBEHIND", "1h")
-
-	config, err := Load()
+	loaded, err := Load()
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if config.PollLookbehind != maxPollLookbehind {
-		t.Fatalf("poll lookbehind = %s, want %s", config.PollLookbehind, maxPollLookbehind)
-	}
-}
-
-func TestLoadRejectsInvalidDiscordEntityIDVisibility(t *testing.T) {
-	setRequiredEnvironment(t)
-	t.Setenv("DISCORD_SHOW_ENTITY_IDS", "sometimes")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected invalid entity ID visibility error")
-	}
-}
-
-func TestLoadRejectsDuplicateDestinationNames(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[
-		{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["structures.combat.under_attack"]},
-		{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/456/token"],"alertTypes":["structures.combat.destroyed"]}
-	]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected duplicate destination name error")
-	}
-}
-
-func TestLoadAlertDestinationsAllShorthand(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"all-alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":[" ALL "]}]`)
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if len(config.AlertDestinations) != 1 || len(config.AlertDestinations[0].AlertTypes) != 1 || config.AlertDestinations[0].AlertTypes[0] != "all" {
-		t.Fatalf("expected all shorthand to enable every category, got %#v", config.AlertDestinations)
-	}
-}
-
-func TestLoadAlertDestinationsSupportsGroupsAndLeafExclusions(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{
-		"name":"skyhook-alerts",
-		"webhookUrls":["https://discord.com/api/webhooks/123/token"],
-		"alertTypes":[" SKYHOOKS.* "],
-		"excludeAlertTypes":[" SKYHOOKS.LOST_SHIELDS "],
-		"excludeStructureTypeIDs":[" 00081080 "]
-	}]`)
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	destination := config.AlertDestinations[0]
-	if len(destination.AlertTypes) != 1 || destination.AlertTypes[0] != "skyhooks" {
-		t.Fatalf("unexpected included alert types: %#v", destination.AlertTypes)
-	}
-	if len(destination.ExcludeAlertTypes) != 1 || destination.ExcludeAlertTypes[0] != "skyhooks.lost_shields" {
-		t.Fatalf("unexpected excluded alert types: %#v", destination.ExcludeAlertTypes)
-	}
-	if len(destination.ExcludeStructureTypeIDs) != 1 || destination.ExcludeStructureTypeIDs[0] != "81080" {
-		t.Fatalf("unexpected excluded structure type IDs: %#v", destination.ExcludeStructureTypeIDs)
-	}
-}
-
-func TestLoadNormalizesNestedAlertGroups(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["STRUCTURES.STATE","skyhooks.*"]}]`)
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	got := config.AlertDestinations[0].AlertTypes
-	if len(got) != 2 || got[0] != "structures.state" || got[1] != "skyhooks" {
-		t.Fatalf("normalized alert types = %#v", got)
-	}
-}
-
-func TestLoadRejectsInvalidStructureTypeFilter(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"excludeStructureTypeIDs":["not-a-type"]}]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected invalid structure type filter error")
-	}
-}
-
-func TestLoadAllowsSingleLeafGroupExclusion(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"excludeAlertTypes":["structures.state.unanchoring"]}]`)
-
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if config.AlertDestinations[0].ExcludeAlertTypes[0] != "structures.state.unanchoring" {
-		t.Fatalf("unexpected excluded alert types: %#v", config.AlertDestinations[0].ExcludeAlertTypes)
-	}
-}
-
-func TestLoadRejectsGroupExclusion(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all"],"excludeAlertTypes":["skyhooks"]}]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected group exclusion error")
-	}
-}
-
-func TestLoadRejectsMixedAllDestinationAlertTypes(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["all","structures.resources"]}]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected mixed all shorthand error")
-	}
-}
-
-func TestLoadRejectsUnknownDestinationAlertType(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, `[{"name":"alerts","webhookUrls":["https://discord.com/api/webhooks/123/token"],"alertTypes":["unknown"]}]`)
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected unknown alert type error")
-	}
-}
-
-func TestLoadRejectsEmptyDestinationConfiguration(t *testing.T) {
-	setRequiredEnvironment(t)
-	writeDestinationsFile(t, "[]")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected empty destination configuration error")
+	if loaded.PollLookbehind != maxPollLookbehind {
+		t.Fatalf("poll lookbehind = %s, want %s", loaded.PollLookbehind, maxPollLookbehind)
 	}
 }

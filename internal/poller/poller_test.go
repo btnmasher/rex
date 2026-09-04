@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
-	alertservice "github.com/btnmasher/rex/internal/alerts"
 	"github.com/btnmasher/rex/internal/authnextdb"
+	"github.com/btnmasher/rex/internal/delivery"
+	"github.com/btnmasher/rex/internal/enrichment"
 	"github.com/btnmasher/rex/internal/esi"
 	"github.com/btnmasher/rex/internal/notificationstate"
 	"github.com/btnmasher/rex/internal/token"
@@ -193,49 +194,6 @@ func TestPollOnceSkipsCorporationWithoutConfiguredTokens(t *testing.T) {
 	}
 }
 
-func TestDrainRetriesDropsExpiredAlertAndAdvancesCursor(t *testing.T) {
-	stateStore := notificationstate.NewMemoryStore()
-	now := time.Now().UTC()
-	esiClient := &pollerESI{timestamp: now}
-	service, err := NewWithConfig(&pollerDatabase{
-		corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp"}},
-	}, &pollerTokens{}, esiClient, &pollerAlerts{}, Config{StateStore: stateStore})
-	if err != nil {
-		t.Fatalf("new poller: %v", err)
-	}
-	if _, err := service.streamSnapshot(context.Background(), "100", "1"); err != nil {
-		t.Fatalf("initialize stream: %v", err)
-	}
-	pending := &notificationstate.PendingNotification{
-		NotificationID:   99,
-		CorporationID:    "100",
-		CharacterID:      "1",
-		NotificationJSON: []byte(`{"notification_id":99,"type":"StructureUnderAttack","timestamp":"2026-09-02T00:00:00Z"}`),
-		CreatedAt:        now.Add(-maxNotificationRetryAge - time.Second),
-		NextRetryAt:      now.Add(-time.Second),
-	}
-	if claimed, err := stateStore.ClaimPending(context.Background(), pending); err != nil || !claimed {
-		t.Fatalf("claim expired pending: claimed=%t err=%v", claimed, err)
-	}
-	if err := service.drainRetries(context.Background()); err != nil {
-		t.Fatalf("drain expired retry: %v", err)
-	}
-	remaining, err := stateStore.ListPending(context.Background(), 10, now)
-	if err != nil {
-		t.Fatalf("list retries: %v", err)
-	}
-	if len(remaining) != 0 {
-		t.Fatalf("expired retry remains queued: %#v", remaining)
-	}
-	cursor, err := stateStore.Load(context.Background(), "100")
-	if err != nil {
-		t.Fatalf("load cursor: %v", err)
-	}
-	if cursor.Streams["1"].LastTimestamp.IsZero() {
-		t.Fatal("expired retry did not advance cursor")
-	}
-}
-
 type emptyTokens struct{}
 
 func (emptyTokens) HasConfiguredTokens(string) bool { return false }
@@ -253,8 +211,43 @@ func (emptyTokens) RefreshAccessToken(context.Context, string, string) (token.Cr
 }
 
 type pollerAlerts struct {
-	count    int
-	failures int
+	count atomic.Int64
+	store notificationstate.Store
+}
+
+func (*pollerAlerts) PreRoute(*enrichment.Envelope) []string {
+	return []string{"test-destination"}
+}
+
+func (a *pollerAlerts) Enqueue(ctx context.Context, request *delivery.EnqueueRequest) (bool, error) {
+	if request == nil {
+		return false, errors.New("enqueue request is required")
+	}
+	if a.store == nil {
+		a.count.Add(1)
+		return true, nil
+	}
+	claimed, err := a.store.Admit(ctx, &notificationstate.Admission{
+		NotificationID: request.Envelope.Event.NotificationID,
+		CorporationID:  request.Envelope.Corporation.ID,
+		Cursor:         request.Cursor,
+		Pending: &notificationstate.PendingNotification{
+			NotificationID:   request.Envelope.Event.NotificationID,
+			CorporationID:    request.Envelope.Corporation.ID,
+			CharacterID:      request.Envelope.CharacterID,
+			NotificationJSON: request.Envelope.RawNotificationJSON,
+			DestinationIDs:   request.DestinationIDs,
+			CreatedAt:        time.Now().UTC(),
+			NextRetryAt:      time.Now().UTC(),
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	if claimed {
+		a.count.Add(1)
+	}
+	return claimed, nil
 }
 
 type failingSaveStateStore struct {
@@ -265,40 +258,6 @@ type failingSaveStateStore struct {
 
 func (s *failingSaveStateStore) Save(context.Context, string, notificationstate.Cursor) error {
 	return s.err
-}
-
-type panicSaveStateStore struct {
-	*notificationstate.MemoryStore
-}
-
-func (*panicSaveStateStore) Save(context.Context, string, notificationstate.Cursor) error {
-	panic("save panic")
-}
-
-type failingClaimStateStore struct {
-	*notificationstate.MemoryStore
-
-	fail atomic.Bool
-}
-
-func (s *failingClaimStateStore) ClaimPending(ctx context.Context, pending *notificationstate.PendingNotification) (bool, error) {
-	if s.fail.Swap(false) {
-		return false, errors.New("claim failed")
-	}
-	return s.MemoryStore.ClaimPending(ctx, pending)
-}
-
-type failingDeleteStateStore struct {
-	*notificationstate.MemoryStore
-
-	fail atomic.Bool
-}
-
-func (s *failingDeleteStateStore) DeletePending(ctx context.Context, notificationID int64) error {
-	if s.fail.Swap(false) {
-		return errors.New("delete failed")
-	}
-	return s.MemoryStore.DeletePending(ctx, notificationID)
 }
 
 func TestAdvanceStreamsDoesNotMutateMemoryWhenSaveFails(t *testing.T) {
@@ -332,33 +291,6 @@ func TestAdvanceStreamsDoesNotMutateMemoryWhenSaveFails(t *testing.T) {
 	}
 }
 
-func TestPollOnceRecoversFromStateSavePanicWithoutDeadlocking(t *testing.T) {
-	stateStore := &panicSaveStateStore{MemoryStore: notificationstate.NewMemoryStore()}
-	service, err := NewWithConfig(
-		&pollerDatabase{corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp"}}},
-		&pollerTokens{},
-		&pollerESI{streams: map[string][]esi.Notification{
-			"1": {{ID: 302, Type: "StructureUnderAttack", Timestamp: time.Now().UTC(), Text: "structure_id: 123456789"}},
-		}},
-		&pollerAlerts{},
-		Config{StateStore: stateStore},
-	)
-	if err != nil {
-		t.Fatalf("new poller: %v", err)
-	}
-	if err := service.PollOnce(context.Background()); err == nil {
-		t.Fatal("expected state save panic to be recovered")
-	}
-
-	finished := make(chan error, 1)
-	go func() { finished <- service.PollOnce(context.Background()) }()
-	select {
-	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("second poll deadlocked after recovered state save panic")
-	}
-}
-
 func TestProcessNotificationsDropsFutureTimestampRows(t *testing.T) {
 	stateStore := notificationstate.NewMemoryStore()
 	alertSink := &pollerAlerts{}
@@ -382,72 +314,8 @@ func TestProcessNotificationsDropsFutureTimestampRows(t *testing.T) {
 	if err := service.processNotifications(context.Background(), corporation, "1", []esi.Notification{item}); err != nil {
 		t.Fatalf("process future notification: %v", err)
 	}
-	if alertSink.count != 0 {
-		t.Fatalf("future notification deliveries = %d, want 0", alertSink.count)
-	}
-}
-
-func TestProcessEligibleNotificationsStopsBeforeCursorCanSkipClaimFailure(t *testing.T) {
-	now := time.Now().UTC()
-	stateStore := &failingClaimStateStore{MemoryStore: notificationstate.NewMemoryStore()}
-	stateStore.fail.Store(true)
-	alertSink := &pollerAlerts{}
-	service, err := NewWithConfig(&pollerDatabase{
-		corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp"}},
-	}, &pollerTokens{}, &pollerESI{}, alertSink, Config{StateStore: stateStore})
-	if err != nil {
-		t.Fatalf("new poller: %v", err)
-	}
-	corporation := authnextdb.Corporation{ID: "100", Name: "Corp"}
-	items := []esi.Notification{
-		{ID: 101, Type: "StructureUnderAttack", Timestamp: now.Add(-time.Minute), Text: "structure_id: 123456789"},
-		{ID: 102, Type: "StructureUnderAttack", Timestamp: now, Text: "structure_id: 123456789"},
-	}
-	if err := service.processNotifications(context.Background(), corporation, "1", items); err == nil {
-		t.Fatal("expected claim failure")
-	}
-	if alertSink.count != 0 {
-		t.Fatalf("later notification was delivered after claim failure: %d", alertSink.count)
-	}
-	if err := service.processNotifications(context.Background(), corporation, "1", items); err != nil {
-		t.Fatalf("retry notifications: %v", err)
-	}
-	if alertSink.count != 2 {
-		t.Fatalf("notifications delivered after retry = %d, want 2", alertSink.count)
-	}
-}
-
-func TestPollOnceSuppressesRetryAfterCursorAdvanceAndDeleteFailure(t *testing.T) {
-	now := time.Now().UTC()
-	item := esi.Notification{ID: 201, Type: "StructureUnderAttack", Timestamp: now, Text: "structure_id: 123456789"}
-	stateStore := &failingDeleteStateStore{MemoryStore: notificationstate.NewMemoryStore()}
-	stateStore.fail.Store(true)
-	alertSink := &pollerAlerts{}
-	service, err := NewWithConfig(&pollerDatabase{
-		corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp"}},
-	}, &pollerTokens{}, &pollerESI{streams: map[string][]esi.Notification{"1": {item}}}, alertSink, Config{StateStore: stateStore})
-	if err != nil {
-		t.Fatalf("new poller: %v", err)
-	}
-	if err := service.PollOnce(context.Background()); err == nil {
-		t.Fatal("expected pending cleanup failure")
-	}
-	if alertSink.count != 1 {
-		t.Fatalf("initial deliveries = %d, want 1", alertSink.count)
-	}
-	pending, err := stateStore.ListPending(context.Background(), 10, time.Now().UTC().Add(time.Minute))
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("pending retries = %v, err=%v", pending, err)
-	}
-	pending[0].NextRetryAt = time.Now().UTC().Add(-time.Second)
-	if err := stateStore.ReschedulePending(context.Background(), &pending[0]); err != nil {
-		t.Fatalf("make retry due: %v", err)
-	}
-	if err := service.PollOnce(context.Background()); err != nil {
-		t.Fatalf("drain cleanup retry: %v", err)
-	}
-	if alertSink.count != 1 {
-		t.Fatalf("deliveries after cleanup retry = %d, want 1", alertSink.count)
+	if alertSink.count.Load() != 0 {
+		t.Fatalf("future notification deliveries = %d, want 0", alertSink.count.Load())
 	}
 }
 
@@ -476,21 +344,13 @@ func TestAdvanceStreamClampsFutureTimestamp(t *testing.T) {
 	}
 }
 
-func (a *pollerAlerts) Deliver(context.Context, *alertservice.DeliveryRequest) error {
-	a.count++
-	if a.failures > 0 {
-		a.failures--
-		return errors.New("delivery failed")
-	}
-	return nil
-}
-
 func TestPollOnceUsesTokenAndSuppressesDuplicate(t *testing.T) {
 	esiClient := &pollerESI{timestamp: time.Now().UTC()}
-	alertSink := &pollerAlerts{}
-	service, err := New(&pollerDatabase{
+	stateStore := notificationstate.NewMemoryStore()
+	alertSink := &pollerAlerts{store: stateStore}
+	service, err := NewWithConfig(&pollerDatabase{
 		corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp", Ticker: "CORP"}},
-	}, &pollerTokens{}, esiClient, alertSink)
+	}, &pollerTokens{}, esiClient, alertSink, Config{StateStore: stateStore})
 	if err != nil {
 		t.Fatalf("new poller: %v", err)
 	}
@@ -500,8 +360,8 @@ func TestPollOnceUsesTokenAndSuppressesDuplicate(t *testing.T) {
 	if err := service.PollOnce(context.Background()); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
-	if alertSink.count != 1 {
-		t.Fatalf("expected one delivery, got %d", alertSink.count)
+	if alertSink.count.Load() != 1 {
+		t.Fatalf("expected one delivery, got %d", alertSink.count.Load())
 	}
 	characters := esiClient.characterSnapshot()
 	if len(characters) != 2 || characters[0] != "1" || characters[1] != "2" {
@@ -528,8 +388,8 @@ func TestPollOnceKeepsIndependentCharacterCursors(t *testing.T) {
 	if err := service.PollOnce(context.Background()); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
-	if alertSink.count != 2 {
-		t.Fatalf("expected both character streams to deliver, got %d", alertSink.count)
+	if alertSink.count.Load() != 2 {
+		t.Fatalf("expected both character streams to deliver, got %d", alertSink.count.Load())
 	}
 }
 
@@ -537,18 +397,19 @@ func TestPollOnceDeduplicatesGlobalNotificationIDAcrossCharacters(t *testing.T) 
 	now := time.Now().UTC()
 	item := esi.Notification{ID: 99, Type: "StructureUnderAttack", Timestamp: now, Text: "structure_id: 123456789"}
 	esiClient := &pollerESI{streams: map[string][]esi.Notification{"1": {item}, "2": {item}}}
-	alertSink := &pollerAlerts{}
-	service, err := New(&pollerDatabase{
+	stateStore := notificationstate.NewMemoryStore()
+	alertSink := &pollerAlerts{store: stateStore}
+	service, err := NewWithConfig(&pollerDatabase{
 		corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp", Ticker: "CORP"}},
-	}, &pollerTokens{}, esiClient, alertSink)
+	}, &pollerTokens{}, esiClient, alertSink, Config{StateStore: stateStore})
 	if err != nil {
 		t.Fatalf("new poller: %v", err)
 	}
 	if err := service.PollOnce(context.Background()); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	if alertSink.count != 1 {
-		t.Fatalf("expected one delivery for globally unique notification ID, got %d", alertSink.count)
+	if alertSink.count.Load() != 1 {
+		t.Fatalf("expected one delivery for globally unique notification ID, got %d", alertSink.count.Load())
 	}
 }
 
@@ -556,21 +417,22 @@ func TestPollOnceDeduplicatesNotificationIDAcrossCorporations(t *testing.T) {
 	now := time.Now().UTC()
 	item := esi.Notification{ID: 101, Type: "StructureUnderAttack", Timestamp: now, Text: "structure_id: 123456789"}
 	esiClient := &pollerESI{streams: map[string][]esi.Notification{"1": {item}, "2": {item}}}
-	alertSink := &pollerAlerts{}
-	service, err := New(&pollerDatabase{
+	stateStore := notificationstate.NewMemoryStore()
+	alertSink := &pollerAlerts{store: stateStore}
+	service, err := NewWithConfig(&pollerDatabase{
 		corporations: []authnextdb.Corporation{
 			{ID: "100", Name: "Corp A", Ticker: "A"},
 			{ID: "200", Name: "Corp B", Ticker: "B"},
 		},
-	}, &pollerTokens{}, esiClient, alertSink)
+	}, &pollerTokens{}, esiClient, alertSink, Config{StateStore: stateStore})
 	if err != nil {
 		t.Fatalf("new poller: %v", err)
 	}
 	if err := service.PollOnce(context.Background()); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	if alertSink.count != 1 {
-		t.Fatalf("expected one delivery for globally unique notification ID, got %d", alertSink.count)
+	if alertSink.count.Load() != 1 {
+		t.Fatalf("expected one delivery for globally unique notification ID, got %d", alertSink.count.Load())
 	}
 }
 
@@ -591,8 +453,8 @@ func TestPollOnceDropsAndMarksMalformedNotifications(t *testing.T) {
 	if err := service.PollOnce(context.Background()); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
-	if alertSink.count != 0 {
-		t.Fatalf("malformed notification was delivered %d times", alertSink.count)
+	if alertSink.count.Load() != 0 {
+		t.Fatalf("malformed notification was delivered %d times", alertSink.count.Load())
 	}
 }
 
@@ -601,7 +463,7 @@ func TestPollOnceRestoresCursorAcrossPollerInstances(t *testing.T) {
 	item := esi.Notification{ID: 100, Type: "StructureUnderAttack", Timestamp: now, Text: "structure_id: 123456789"}
 	stateStore := notificationstate.NewMemoryStore()
 	database := &pollerDatabase{corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp", Ticker: "CORP"}}}
-	firstAlerts := &pollerAlerts{}
+	firstAlerts := &pollerAlerts{store: stateStore}
 	first, err := NewWithConfig(
 		database,
 		&pollerTokens{},
@@ -616,7 +478,7 @@ func TestPollOnceRestoresCursorAcrossPollerInstances(t *testing.T) {
 		t.Fatalf("first poll: %v", err)
 	}
 
-	secondAlerts := &pollerAlerts{}
+	secondAlerts := &pollerAlerts{store: stateStore}
 	second, err := NewWithConfig(
 		database,
 		&pollerTokens{},
@@ -630,8 +492,8 @@ func TestPollOnceRestoresCursorAcrossPollerInstances(t *testing.T) {
 	if err := second.PollOnce(context.Background()); err != nil {
 		t.Fatalf("second poll: %v", err)
 	}
-	if firstAlerts.count != 1 || secondAlerts.count != 0 {
-		t.Fatalf("expected durable deduplication across poller instances, got first=%d second=%d", firstAlerts.count, secondAlerts.count)
+	if firstAlerts.count.Load() != 1 || secondAlerts.count.Load() != 0 {
+		t.Fatalf("expected durable deduplication across poller instances, got first=%d second=%d", firstAlerts.count.Load(), secondAlerts.count.Load())
 	}
 }
 
@@ -671,8 +533,8 @@ func TestProcessNotificationsDiscardsExistingStreamRowsOutsideLookbehind(t *test
 	if err := service.processNotifications(context.Background(), corporation, "1", []esi.Notification{item}); err != nil {
 		t.Fatalf("second process: %v", err)
 	}
-	if alertSink.count != 0 {
-		t.Fatalf("stale notification was delivered %d times", alertSink.count)
+	if alertSink.count.Load() != 0 {
+		t.Fatalf("stale notification was delivered %d times", alertSink.count.Load())
 	}
 
 	cursor, err := stateStore.Load(context.Background(), "100")
@@ -681,42 +543,5 @@ func TestProcessNotificationsDiscardsExistingStreamRowsOutsideLookbehind(t *test
 	}
 	if got := cursor.Streams["1"].LastTimestamp; !got.Equal(item.Timestamp) {
 		t.Fatalf("cursor timestamp = %v, want %v", got, item.Timestamp)
-	}
-}
-
-func TestPollOncePersistsAndDrainsNotificationRetry(t *testing.T) {
-	now := time.Now().UTC()
-	item := esi.Notification{ID: 200, Type: "StructureUnderAttack", Timestamp: now, Text: "structure_id: 123456789"}
-	stateStore := notificationstate.NewMemoryStore()
-	alertSink := &pollerAlerts{failures: 1}
-	service, err := NewWithConfig(&pollerDatabase{
-		corporations: []authnextdb.Corporation{{ID: "100", Name: "Corp", Ticker: "CORP"}},
-	}, &pollerTokens{}, &pollerESI{streams: map[string][]esi.Notification{"1": {item}}}, alertSink, Config{StateStore: stateStore})
-	if err != nil {
-		t.Fatalf("new poller: %v", err)
-	}
-	if err := service.PollOnce(context.Background()); err == nil {
-		t.Fatal("expected initial delivery failure")
-	}
-	pending, err := stateStore.ListPending(context.Background(), 10, time.Now().UTC().Add(time.Minute))
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("expected one pending retry, pending=%v err=%v", pending, err)
-	}
-	pending[0].NextRetryAt = time.Now().UTC().Add(-time.Second)
-	if err := stateStore.ReschedulePending(context.Background(), &pending[0]); err != nil {
-		t.Fatalf("make retry due: %v", err)
-	}
-	if err := service.PollOnce(context.Background()); err != nil {
-		t.Fatalf("drain retry: %v", err)
-	}
-	if err := service.PollOnce(context.Background()); err != nil {
-		t.Fatalf("poll after retry: %v", err)
-	}
-	if alertSink.count != 2 {
-		t.Fatalf("expected one initial attempt and one retry, got %d", alertSink.count)
-	}
-	pending, err = stateStore.ListPending(context.Background(), 10, time.Now().UTC().Add(time.Minute))
-	if err != nil || len(pending) != 0 {
-		t.Fatalf("expected retry to be removed after success, pending=%v err=%v", pending, err)
 	}
 }

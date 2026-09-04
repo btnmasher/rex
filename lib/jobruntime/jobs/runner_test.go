@@ -127,6 +127,20 @@ func TestRegisterStepValidation(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsNilContext(t *testing.T) {
+	r, err := NewRunner(&fakeJobsStore{}, testCodec{})
+	if err != nil {
+		t.Fatalf("new runner: %v", err)
+	}
+	if err := r.RunOnce(nilContext(), "run-1"); err == nil {
+		t.Fatal("expected nil context error")
+	}
+}
+
+func nilContext() context.Context {
+	return nil
+}
+
 func TestRunOnceReturnsPipelineErrorOnClaimFailure(t *testing.T) {
 	store := &fakeJobsStore{claimErr: errors.New("claim failed")}
 	r, err := NewRunner(store, testCodec{}, WithProducer(noopProducer{}))

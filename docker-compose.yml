@@ -11,7 +11,7 @@ services:
     environment:
       JOB_STORE_SQLITE_PATH: /data/rex-jobruntime.sqlite
       NOTIFICATION_STATE_SQLITE_PATH: /data/rex-notification-state.sqlite
-      ALERT_DESTINATIONS_FILE: /etc/rex/alert-destinations.json
+      ALERT_DESTINATIONS_CONFIG: /etc/rex/alert-destinations.json
     volumes:
       - rex-state:/data
       - ./alert-destinations.json:/etc/rex/alert-destinations.json:ro,Z

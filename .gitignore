@@ -33,6 +33,7 @@ go.work.sum
 
 # Local alert routing configuration contains webhook secrets.
 alert-destinations.json
+alert-destinations.yml
 
 # Local SQLite databases and journaling sidecars.
 *.sqlite*

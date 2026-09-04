@@ -8,9 +8,11 @@ ephemeral or SQLC-backed PostgreSQL stores.
 ## Ownership
 
 - jobstore defines the stable lifecycle interface and data types.
+- scheduler defines wall-clock-aligned, non-overlapping periodic execution for
+  callers that need recurring job orchestration.
 - jobstore/memory owns process-local state for tests and single-process jobs.
 - jobstore/sqlite owns the SQLC-backed single-process durable implementation.
-- jobstore/postgres owns SQLC queries and only rex-owned job tables.
+- jobstore/postgres owns SQLC queries and only jobruntime-owned job tables.
 - jobs depends on the interface, never on pgx or application domains.
 
 ## Local Contracts
@@ -33,8 +35,10 @@ ephemeral or SQLC-backed PostgreSQL stores.
   configured bounded retry path, while lifecycle panics must return an error
   and best-effort mark the run failed. Log panic type and stack context without
   persisting the panic value.
+- Public runner entry points reject nil contexts immediately; runtime recovery
+  derives bounded cleanup contexts from the caller context.
 - Store constructors apply only the embedded jobstore migrations for
-  repository-owned durable state; SQLite and PostgreSQL never migrate
+  jobruntime-owned durable state; SQLite and PostgreSQL never migrate
   application-owned tables.
 - Durable store constructors accept a caller-owned context and must use it for
   connection initialization and Goose migrations; callers must derive it from
@@ -42,6 +46,9 @@ ephemeral or SQLC-backed PostgreSQL stores.
 
 ## Verification
 
-Run task verify from the repository root. For focused work, use go test ./...,
-go vet ./..., and golangci-lint run -c ../../golangci.yml ./... from this
-module.
+From this module directory, run `go test ./...`, `go vet ./...`, and
+`go test -race ./...`.
+
+## Child DOX Index
+
+- `scheduler/AGENTS.md` defines the wall-clock scheduling contract.

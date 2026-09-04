@@ -14,7 +14,7 @@ import (
 
 const (
 	notificationTokenCooldown = 10 * time.Minute
-	tokenSmoothingThreshold   = 10
+	maxTokenPoolSize          = 64
 )
 
 // ExportSource supplies validated access-token groups from auth-next.
@@ -25,9 +25,8 @@ type ExportSource interface {
 
 // Credential is the selected EVE identity and access token for one ESI request.
 type Credential struct {
-	CharacterID   string
-	CharacterName string
-	AccessToken   string
+	CharacterID string
+	AccessToken string
 }
 
 // Provider manages corporation-scoped access tokens and notification rotation.
@@ -53,10 +52,9 @@ type corporationGroup struct {
 }
 
 type tokenRecord struct {
-	characterID   string
-	characterName string
-	accessToken   string
-	expiresAt     time.Time
+	characterID string
+	accessToken string
+	expiresAt   time.Time
 }
 
 type accessKey struct {
@@ -71,9 +69,14 @@ type refreshCall struct {
 }
 
 // NewProvider creates an access-token provider backed by the auth-next export source.
-func NewProvider(source ExportSource) (*Provider, error) {
+// pollInterval controls how frequently a corporation may be polled and is used
+// to determine when token rotation must be stretched to honor identity cooldowns.
+func NewProvider(source ExportSource, pollInterval time.Duration) (*Provider, error) {
 	if source == nil {
 		return nil, errors.New("token provider source is required")
+	}
+	if pollInterval <= 0 {
+		return nil, errors.New("token provider poll interval must be positive")
 	}
 	provider := &Provider{
 		source:               source,
@@ -82,7 +85,7 @@ func NewProvider(source ExportSource) (*Provider, error) {
 		lastCorporationPoll:  make(map[string]time.Time),
 		lastRefreshedAt:      make(map[string]time.Time),
 		notificationCooldown: notificationTokenCooldown,
-		minimumPollInterval:  time.Minute,
+		minimumPollInterval:  pollInterval,
 		corporationLocks:     newKeyedLocker(),
 		eligibleCorporations: make(map[string]struct{}),
 		refreshes:            make(map[string]*refreshCall),
@@ -92,6 +95,12 @@ func NewProvider(source ExportSource) (*Provider, error) {
 
 // NextAccessToken selects the next corporation credential in round-robin order.
 func (p *Provider) NextAccessToken(ctx context.Context, corporationID string) (Credential, error) {
+	if p == nil {
+		return Credential{}, errors.New("token provider is unavailable")
+	}
+	if ctx == nil {
+		return Credential{}, errors.New("token selection context is required")
+	}
 	if err := ctx.Err(); err != nil {
 		return Credential{}, err
 	}
@@ -105,6 +114,12 @@ func (p *Provider) NextAccessToken(ctx context.Context, corporationID string) (C
 
 // RefreshCorporation fetches and installs a fresh access-token set for a corporation.
 func (p *Provider) RefreshCorporation(ctx context.Context, corporationID string) error {
+	if p == nil {
+		return errors.New("token provider is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("token refresh context is required")
+	}
 	if strings.TrimSpace(corporationID) == "" {
 		return ErrNoUsableToken
 	}
@@ -115,6 +130,12 @@ func (p *Provider) RefreshCorporation(ctx context.Context, corporationID string)
 // RefreshCorporationIfDue refreshes a corporation only when its last successful
 // refresh is older than minimumAge. Concurrent refreshes share one fetch.
 func (p *Provider) RefreshCorporationIfDue(ctx context.Context, corporationID string, minimumAge time.Duration) (bool, error) {
+	if p == nil {
+		return false, errors.New("token provider is unavailable")
+	}
+	if ctx == nil {
+		return false, errors.New("token refresh context is required")
+	}
 	if strings.TrimSpace(corporationID) == "" {
 		return false, ErrNoUsableToken
 	}
@@ -123,6 +144,12 @@ func (p *Provider) RefreshCorporationIfDue(ctx context.Context, corporationID st
 
 // RefreshAccessToken fetches a fresh access-token set for a corporation after an ESI authentication failure.
 func (p *Provider) RefreshAccessToken(ctx context.Context, corporationID, characterID string) (Credential, error) {
+	if p == nil {
+		return Credential{}, errors.New("token provider is unavailable")
+	}
+	if ctx == nil {
+		return Credential{}, errors.New("token refresh context is required")
+	}
 	if strings.TrimSpace(corporationID) == "" || strings.TrimSpace(characterID) == "" {
 		return Credential{}, ErrNoUsableToken
 	}
@@ -132,20 +159,8 @@ func (p *Provider) RefreshAccessToken(ctx context.Context, corporationID, charac
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	group := p.groups[corporationID]
-	if group == nil {
-		return Credential{}, ErrNoUsableToken
-	}
-	for _, record := range group.tokens {
-		if record.characterID == characterID && (record.expiresAt.IsZero() || time.Now().Before(record.expiresAt)) {
-			return credentialFromRecord(record), nil
-		}
-	}
-	for offset := range group.tokens {
-		record := group.tokens[(group.nextIndex+offset)%len(group.tokens)]
-		if record.accessToken != "" && (record.expiresAt.IsZero() || time.Now().Before(record.expiresAt)) {
-			return credentialFromRecord(record), nil
-		}
+	if credential, ok := p.refreshedCredentialLocked(corporationID, characterID); ok {
+		return credential, nil
 	}
 	return Credential{}, fmt.Errorf("%w: corporation %s", ErrNoUsableToken, corporationID)
 }
@@ -233,6 +248,25 @@ func (p *Provider) InstallCorporation(ctx context.Context, group tokenexport.Cor
 	return nil
 }
 
+func (p *Provider) refreshedCredentialLocked(corporationID, characterID string) (Credential, bool) {
+	group := p.groups[corporationID]
+	if group == nil {
+		return Credential{}, false
+	}
+	for _, record := range group.tokens {
+		if record.characterID == characterID && (record.expiresAt.IsZero() || time.Now().Before(record.expiresAt)) {
+			return credentialFromRecord(record), true
+		}
+	}
+	for offset := range group.tokens {
+		record := group.tokens[(group.nextIndex+offset)%len(group.tokens)]
+		if record.accessToken != "" && (record.expiresAt.IsZero() || time.Now().Before(record.expiresAt)) {
+			return credentialFromRecord(record), true
+		}
+	}
+	return Credential{}, false
+}
+
 func (p *Provider) installCorporationLocked(group tokenexport.CorporationTokenGroup) {
 	oldGroup := p.groups[group.CorporationID]
 	newGroup := newCorporationGroup(group)
@@ -277,11 +311,6 @@ func (p *Provider) refreshCorporation(ctx context.Context, corporationID string,
 }
 
 func (p *Provider) fetchAndInstallCorporation(ctx context.Context, corporationID string) (bool, error) {
-	release, err := p.corporationLocks.Acquire(ctx, corporationID)
-	if err != nil {
-		return false, err
-	}
-	defer release()
 	response, err := p.source.FetchCorporation(ctx, corporationID)
 	if err != nil {
 		return false, err
@@ -429,7 +458,7 @@ func (p *Provider) corporationPollRetryAfter(corporationID string) time.Duration
 	if group == nil || len(group.tokens) == 0 {
 		return 0
 	}
-	if len(group.tokens) >= tokenSmoothingThreshold {
+	if len(group.tokens) >= p.requiredTokenCount() {
 		return 0
 	}
 	cadence := p.notificationCooldown / time.Duration(len(group.tokens))
@@ -440,6 +469,17 @@ func (p *Provider) corporationPollRetryAfter(corporationID string) time.Duration
 	}
 	retryAfter := time.Until(lastPoll.Add(cadence))
 	return max(retryAfter, 0)
+}
+
+func (p *Provider) requiredTokenCount() int {
+	if p == nil || p.minimumPollInterval <= 0 {
+		return 1
+	}
+	required := int(p.notificationCooldown / p.minimumPollInterval)
+	if p.notificationCooldown%p.minimumPollInterval != 0 {
+		required++
+	}
+	return max(required, 1)
 }
 
 func (p *Provider) markNotificationUse(corporationID, characterID string) {
@@ -498,10 +538,9 @@ func newCorporationGroup(group tokenexport.CorporationTokenGroup) *corporationGr
 	tokens := make([]tokenRecord, 0, len(group.Tokens))
 	for _, token := range group.Tokens {
 		tokens = append(tokens, tokenRecord{
-			characterID:   token.CharacterID,
-			characterName: token.CharacterName,
-			accessToken:   token.AccessToken,
-			expiresAt:     token.ExpiresAt,
+			characterID: token.CharacterID,
+			accessToken: token.AccessToken,
+			expiresAt:   token.ExpiresAt,
 		})
 	}
 	return &corporationGroup{tokens: tokens}
@@ -509,9 +548,8 @@ func newCorporationGroup(group tokenexport.CorporationTokenGroup) *corporationGr
 
 func credentialFromRecord(record tokenRecord) Credential {
 	return Credential{
-		CharacterID:   record.characterID,
-		CharacterName: record.characterName,
-		AccessToken:   record.accessToken,
+		CharacterID: record.characterID,
+		AccessToken: record.accessToken,
 	}
 }
 

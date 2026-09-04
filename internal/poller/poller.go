@@ -13,26 +13,22 @@ import (
 	"sync"
 	"time"
 
-	alertservice "github.com/btnmasher/rex/internal/alerts"
 	"github.com/btnmasher/rex/internal/authnextdb"
+	"github.com/btnmasher/rex/internal/delivery"
+	"github.com/btnmasher/rex/internal/enrichment"
 	"github.com/btnmasher/rex/internal/esi"
 	"github.com/btnmasher/rex/internal/notifications"
 	"github.com/btnmasher/rex/internal/notificationstate"
 	"github.com/btnmasher/rex/internal/token"
+	"github.com/btnmasher/rex/jobruntime/scheduler"
 )
 
 const (
-	defaultConcurrency      = 8
-	defaultInterval         = time.Minute
-	defaultLookbehind       = 10 * time.Minute
-	maxLookbehind           = 10 * time.Minute
-	seenRetention           = time.Hour
-	retryDrainLimit         = 32
-	maxNotificationRetries  = 6
-	notificationRetryBase   = 5 * time.Second
-	notificationRetryMax    = 5 * time.Minute
-	maxNotificationRetryAge = 30 * time.Minute
-	maxRetryErrorMessage    = 4096
+	defaultConcurrency = 8
+	defaultInterval    = time.Minute
+	defaultLookbehind  = 10 * time.Minute
+	maxLookbehind      = 10 * time.Minute
+	seenRetention      = time.Hour
 )
 
 // TokenSource supplies corporation-scoped, refreshable EVE credentials.
@@ -48,9 +44,15 @@ type ESIClient interface {
 	Notifications(context.Context, string, string) ([]esi.Notification, error)
 }
 
-// AlertSink delivers classified events to configured destinations.
-type AlertSink interface {
-	Deliver(context.Context, *alertservice.DeliveryRequest) error
+// AlertAdmission admits classified notifications for asynchronous delivery.
+type AlertAdmission interface {
+	delivery.Enqueuer
+	PreRouter
+}
+
+// PreRouter selects candidate destinations using only raw notification data.
+type PreRouter interface {
+	PreRoute(*enrichment.Envelope) []string
 }
 
 // Database is the persistence subset needed by the polling scheduler.
@@ -109,7 +111,7 @@ type Poller struct {
 	database    Database
 	tokens      TokenSource
 	esi         ESIClient
-	alerts      AlertSink
+	admission   AlertAdmission
 	interval    time.Duration
 	lookbehind  time.Duration
 	concurrency int
@@ -121,13 +123,13 @@ type Poller struct {
 }
 
 // New creates a notification poller with default configuration.
-func New(database Database, tokens TokenSource, esiClient ESIClient, alertSink AlertSink) (*Poller, error) {
-	return NewWithConfig(database, tokens, esiClient, alertSink, Config{})
+func New(database Database, tokens TokenSource, esiClient ESIClient, admission AlertAdmission) (*Poller, error) {
+	return NewWithConfig(database, tokens, esiClient, admission, Config{})
 }
 
 // NewWithConfig creates a notification poller with explicit runtime configuration.
-func NewWithConfig(database Database, tokens TokenSource, esiClient ESIClient, alertSink AlertSink, config Config) (*Poller, error) {
-	if database == nil || tokens == nil || esiClient == nil || alertSink == nil {
+func NewWithConfig(database Database, tokens TokenSource, esiClient ESIClient, admission AlertAdmission, config Config) (*Poller, error) {
+	if database == nil || tokens == nil || esiClient == nil || admission == nil {
 		return nil, errors.New("poller dependencies are required")
 	}
 	config = config.withDefaults()
@@ -135,7 +137,7 @@ func NewWithConfig(database Database, tokens TokenSource, esiClient ESIClient, a
 		database:    database,
 		tokens:      tokens,
 		esi:         esiClient,
-		alerts:      alertSink,
+		admission:   admission,
 		interval:    config.Interval,
 		lookbehind:  config.Lookbehind,
 		concurrency: config.Concurrency,
@@ -145,27 +147,32 @@ func NewWithConfig(database Database, tokens TokenSource, esiClient ESIClient, a
 	}, nil
 }
 
-// Run polls immediately and then on the configured interval until cancellation.
+// Run polls immediately and then on wall-clock-aligned boundaries until cancellation.
 func (p *Poller) Run(ctx context.Context) error {
+	if p == nil {
+		return errors.New("notification poller is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("notification poller context is required")
+	}
 	if err := p.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		p.logger.Error("initial notification poll failed", "err", err)
 	}
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := p.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				p.logger.Error("notification poll failed", "err", err)
-			}
+	return scheduler.Run(ctx, p.interval, func(ctx context.Context) {
+		if err := p.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			p.logger.Error("notification poll failed", "err", err)
 		}
-	}
+	})
 }
 
 // PollOnce runs one bounded, non-overlapping poll for all eligible corporations.
 func (p *Poller) PollOnce(ctx context.Context) (err error) {
+	if p == nil {
+		return errors.New("notification poller is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("notification poller context is required")
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			p.logger.Error("notification poll panic recovered",
@@ -197,10 +204,6 @@ func (p *Poller) pollOnce(ctx context.Context) error {
 	if err := p.stateStore.PruneSeen(ctx, time.Now().UTC().Add(-seenRetention)); err != nil {
 		return fmt.Errorf("prune seen notifications: %w", err)
 	}
-	if err := p.drainRetries(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		p.logger.Warn("notification retry drain failed", "err", err)
-	}
-
 	corporations, err := p.database.ListNotificationCorporations(ctx)
 	if err != nil {
 		return err
@@ -499,30 +502,114 @@ func (p *Poller) processEligibleNotification(
 		CorporationName:   corporation.Name,
 		CorporationTicker: corporation.Ticker,
 		CharacterID:       characterID,
-		NotificationJSON:  payload,
-		CreatedAt:         time.Now().UTC(),
-		NextRetryAt:       time.Now().UTC().Add(notificationRetryBase),
+		NotificationJSON:  append([]byte(nil), payload...),
 	}
-	if err := pending.Validate(); err != nil {
-		return p.dropMalformedNotification(ctx, corporation.ID, characterID, item, err)
+	envelope := &enrichment.Envelope{
+		Corporation:         corporation,
+		CharacterID:         characterID,
+		RawNotificationJSON: payload,
+		Event:               event,
 	}
-	claimed, err := p.stateStore.ClaimPending(ctx, pending)
+	destinationIDs := p.admission.PreRoute(envelope)
+	pending.DestinationIDs = destinationIDs
+	if len(destinationIDs) == 0 {
+		pending = nil
+	}
+	claimed, err := p.admitNotification(ctx, envelope, item, pending)
 	if err != nil {
-		return fmt.Errorf("claim notification %d: %w", item.ID, err)
+		return fmt.Errorf("admit notification %d: %w", item.ID, err)
+	}
+	if pending == nil {
+		p.logger.Debug("notification ignored",
+			"notification_id", item.ID,
+			"notification_type", item.Type,
+			"reason", "no_configured_destinations",
+		)
+		return nil
 	}
 	if !claimed {
 		p.logger.Debug("notification suppressed",
 			"notification_id", item.ID,
 			"reason", "already_seen_or_pending",
 		)
-		return p.advanceStream(ctx, corporation.ID, characterID, item)
+		return nil
 	}
-	p.logger.Info("notification claimed for alert delivery",
+	p.logger.Info("notification queued for alert delivery",
 		"notification_id", item.ID,
 		"alert_type", event.AlertType,
 		"corporation_id", corporation.ID,
 	)
-	return p.deliverClaimedNotification(ctx, corporation, characterID, item, payload, &event)
+	return nil
+}
+
+func (p *Poller) admitNotification(
+	ctx context.Context,
+	envelope *enrichment.Envelope,
+	item *esi.Notification,
+	pending *notificationstate.PendingNotification,
+) (bool, error) {
+	if envelope == nil || item == nil {
+		return false, errors.New("notification admission input is required")
+	}
+	corporationID := envelope.Corporation.ID
+	if err := p.loadState(ctx, corporationID); err != nil {
+		return false, err
+	}
+	p.mu.Lock()
+	state := p.stateLocked(corporationID)
+	candidate := p.cursorLocked(state)
+	applyCursorItems(&candidate, envelope.CharacterID, []esi.Notification{*item}, time.Now().UTC())
+	p.mu.Unlock()
+
+	claimed, err := p.admission.Enqueue(ctx, &delivery.EnqueueRequest{
+		Envelope:       *envelope,
+		DestinationIDs: pendingDestinationIDs(pending),
+		Cursor:         candidate,
+	})
+	if err != nil {
+		return false, err
+	}
+	p.mu.Lock()
+	state = p.stateLocked(corporationID)
+	stream := candidate.Streams[envelope.CharacterID]
+	state.streams[envelope.CharacterID] = &cursor{
+		lastTimestamp: stream.LastTimestamp,
+		seenAtCursor:  stream.SeenAtCursor,
+	}
+	p.mu.Unlock()
+	return claimed, nil
+}
+
+func pendingDestinationIDs(pending *notificationstate.PendingNotification) []string {
+	if pending == nil {
+		return nil
+	}
+	return append([]string(nil), pending.DestinationIDs...)
+}
+
+func applyCursorItems(cursor *notificationstate.Cursor, characterID string, items []esi.Notification, now time.Time) {
+	if cursor == nil {
+		return
+	}
+	stream := cursor.Streams[characterID]
+	if stream.SeenAtCursor == nil {
+		stream.SeenAtCursor = make(map[int64]struct{})
+	}
+	for index := range items {
+		item := &items[index]
+		cursorTimestamp := item.Timestamp
+		if cursorTimestamp.After(now) {
+			cursorTimestamp = now
+		}
+		if cursorTimestamp.After(stream.LastTimestamp) {
+			stream.LastTimestamp = cursorTimestamp
+			stream.SeenAtCursor = make(map[int64]struct{})
+		}
+		if cursorTimestamp.Equal(stream.LastTimestamp) {
+			stream.SeenAtCursor[item.ID] = struct{}{}
+		}
+	}
+	cursor.Streams[characterID] = stream
 }
 
 func (p *Poller) dropMalformedNotification(
@@ -598,43 +685,6 @@ func isStaleNotification(item *esi.Notification, state cursorSnapshot, cutoff ti
 func hasSeen(seen map[int64]struct{}, notificationID int64) bool {
 	_, ok := seen[notificationID]
 	return ok
-}
-
-func (p *Poller) deliverClaimedNotification(
-	ctx context.Context,
-	corporation authnextdb.Corporation,
-	characterID string,
-	item *esi.Notification,
-	payload []byte,
-	event *notifications.Event,
-) error {
-	deliveryErr := p.alerts.Deliver(ctx, &alertservice.DeliveryRequest{
-		Corporation:         corporation,
-		CharacterID:         characterID,
-		RawNotificationJSON: append([]byte(nil), payload...),
-		Event:               event,
-	})
-	if deliveryErr != nil {
-		pending := notificationstate.PendingNotification{
-			NotificationID:    item.ID,
-			CorporationID:     corporation.ID,
-			CorporationName:   corporation.Name,
-			CorporationTicker: corporation.Ticker,
-			CharacterID:       characterID,
-			NotificationJSON:  append([]byte(nil), payload...),
-			Attempts:          1,
-			NextRetryAt:       time.Now().UTC().Add(notificationRetryDelay(1)),
-			LastError:         retryErrorMessage(deliveryErr),
-		}
-		return p.rescheduleDeliveryFailure(ctx, &pending, deliveryErr)
-	}
-	if err := p.advanceStream(ctx, corporation.ID, characterID, item); err != nil {
-		return fmt.Errorf("advance delivered notification %d cursor: %w", item.ID, err)
-	}
-	if err := p.stateStore.DeletePending(ctx, item.ID); err != nil {
-		return fmt.Errorf("delete delivered notification %d retry: %w", item.ID, err)
-	}
-	return nil
 }
 
 func (p *Poller) streamSnapshot(ctx context.Context, corporationID, characterID string) (cursorSnapshot, error) {
@@ -751,222 +801,4 @@ func (p *Poller) cursorLocked(state *corporationState) notificationstate.Cursor 
 		cursor.Streams[characterID] = notificationstate.Stream{LastTimestamp: stream.lastTimestamp, SeenAtCursor: seen}
 	}
 	return cursor
-}
-
-func (p *Poller) drainRetries(ctx context.Context) error {
-	now := time.Now().UTC()
-	due, err := p.stateStore.ListPending(ctx, retryDrainLimit, now)
-	if err != nil {
-		return err
-	}
-	if len(due) > 0 {
-		p.logger.Debug("notification retry drain started",
-			"pending_count", len(due),
-			"batch_limit", retryDrainLimit,
-		)
-	}
-
-	var errs []error
-	for i := range due {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := p.retryNotification(ctx, &due[i]); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(due) > 0 {
-		p.logger.Debug("notification retry drain completed",
-			"pending_count", len(due),
-			"error_count", len(errs),
-		)
-	}
-	return errors.Join(errs...)
-}
-
-func (p *Poller) retryNotification(ctx context.Context, item *notificationstate.PendingNotification) error {
-	if item == nil {
-		return errors.New("pending notification is required")
-	}
-	var notification esi.Notification
-	if err := json.Unmarshal(item.NotificationJSON, &notification); err != nil {
-		return p.dropMalformedRetry(ctx, item, err)
-	}
-	if err := notification.Validate(); err != nil {
-		return p.dropMalformedRetry(ctx, item, err)
-	}
-	alreadyAdvanced, err := p.pendingNotificationAlreadyAdvanced(ctx, item, &notification)
-	if err != nil {
-		return err
-	}
-	if alreadyAdvanced {
-		if err := p.stateStore.DeletePending(ctx, item.NotificationID); err != nil {
-			return fmt.Errorf("delete already delivered notification %d retry: %w", item.NotificationID, err)
-		}
-		p.logger.Debug("notification retry suppressed after cursor advance",
-			"notification_id", item.NotificationID,
-		)
-		return nil
-	}
-	if retryExpired(item, time.Now().UTC()) {
-		return p.dropExpiredRetry(ctx, item, &notification)
-	}
-	event, ok := notifications.Classify(&notification)
-	corporation := authnextdb.Corporation{ID: item.CorporationID, Name: item.CorporationName, Ticker: item.CorporationTicker}
-	if !ok {
-		if err := p.stateStore.DeletePending(ctx, item.NotificationID); err != nil {
-			return fmt.Errorf("delete ignored notification %d retry: %w", item.NotificationID, err)
-		}
-		return p.advanceStream(ctx, item.CorporationID, item.CharacterID, &notification)
-	}
-	deliveryErr := p.alerts.Deliver(ctx, &alertservice.DeliveryRequest{
-		Corporation:         corporation,
-		CharacterID:         item.CharacterID,
-		RawNotificationJSON: append([]byte(nil), item.NotificationJSON...),
-		Event:               &event,
-		DestinationIDs:      item.FailedDestinationIDs,
-	})
-	if deliveryErr == nil {
-		return p.completePendingNotification(ctx, item, &notification)
-	}
-	item.Attempts++
-	item.FailedDestinationIDs = failedDestinationIDs(deliveryErr)
-	if item.Attempts >= maxNotificationRetries {
-		return p.dropExhaustedRetry(ctx, item, &notification, deliveryErr)
-	}
-	if retryExpired(item, time.Now().UTC()) {
-		return p.dropExpiredDeliveryRetry(ctx, item, &notification, deliveryErr)
-	}
-	item.NextRetryAt = time.Now().UTC().Add(notificationRetryDelay(item.Attempts))
-	item.LastError = retryErrorMessage(deliveryErr)
-	return p.rescheduleDeliveryFailure(ctx, item, deliveryErr)
-}
-
-func (p *Poller) dropMalformedRetry(ctx context.Context, item *notificationstate.PendingNotification, reason error) error {
-	deleteErr := p.stateStore.DeletePending(ctx, item.NotificationID)
-	if deleteErr != nil {
-		return errors.Join(
-			fmt.Errorf("drop malformed notification %d retry: %w", item.NotificationID, reason),
-			fmt.Errorf("delete malformed notification %d retry: %w", item.NotificationID, deleteErr),
-		)
-	}
-	return fmt.Errorf("drop malformed notification %d retry: %w", item.NotificationID, reason)
-}
-
-func (p *Poller) dropExpiredRetry(ctx context.Context, item *notificationstate.PendingNotification, notification *esi.Notification) error {
-	if err := p.stateStore.DeletePending(ctx, item.NotificationID); err != nil {
-		return fmt.Errorf("delete expired notification %d retry: %w", item.NotificationID, err)
-	}
-	p.logger.Warn("notification retry expired and was dropped",
-		"notification_id", item.NotificationID,
-		"created_at", item.CreatedAt,
-		"max_age", maxNotificationRetryAge,
-	)
-	return p.advanceStream(ctx, item.CorporationID, item.CharacterID, notification)
-}
-
-func (p *Poller) dropExhaustedRetry(ctx context.Context, item *notificationstate.PendingNotification, notification *esi.Notification, deliveryErr error) error {
-	if deleteErr := p.stateStore.DeletePending(ctx, item.NotificationID); deleteErr != nil {
-		return errors.Join(deliveryErr, fmt.Errorf("delete exhausted notification %d retry: %w", item.NotificationID, deleteErr))
-	}
-	p.logger.Warn("notification retry limit reached; alert dropped",
-		"notification_id", item.NotificationID,
-		"attempts", item.Attempts,
-		"err", deliveryErr,
-	)
-	return p.advanceStream(ctx, item.CorporationID, item.CharacterID, notification)
-}
-
-func (p *Poller) dropExpiredDeliveryRetry(ctx context.Context, item *notificationstate.PendingNotification, notification *esi.Notification, deliveryErr error) error {
-	if deleteErr := p.stateStore.DeletePending(ctx, item.NotificationID); deleteErr != nil {
-		return errors.Join(deliveryErr, fmt.Errorf("delete expired notification %d retry: %w", item.NotificationID, deleteErr))
-	}
-	p.logger.Warn("notification retry expired after delivery failure; alert dropped",
-		"notification_id", item.NotificationID,
-		"created_at", item.CreatedAt,
-		"max_age", maxNotificationRetryAge,
-		"err", deliveryErr,
-	)
-	return p.advanceStream(ctx, item.CorporationID, item.CharacterID, notification)
-}
-
-func (p *Poller) rescheduleDeliveryFailure(ctx context.Context, pending *notificationstate.PendingNotification, deliveryErr error) error {
-	pending.FailedDestinationIDs = failedDestinationIDs(deliveryErr)
-	if err := p.stateStore.ReschedulePending(ctx, pending); err != nil {
-		queuedErr := fmt.Errorf("notification %d queued for retry: %w", pending.NotificationID, deliveryErr)
-		rescheduleErr := fmt.Errorf("reschedule notification retry: %w", err)
-		return errors.Join(queuedErr, rescheduleErr)
-	}
-	p.logger.Warn("notification delivery retry persisted",
-		"notification_id", pending.NotificationID,
-		"attempts", pending.Attempts,
-		"next_retry_at", pending.NextRetryAt,
-		"failed_destination_ids", pending.FailedDestinationIDs,
-		"err", deliveryErr,
-	)
-	return fmt.Errorf("notification %d queued for retry: %w", pending.NotificationID, deliveryErr)
-}
-
-func (p *Poller) completePendingNotification(
-	ctx context.Context,
-	item *notificationstate.PendingNotification,
-	notification *esi.Notification,
-) error {
-	if err := p.advanceStream(ctx, item.CorporationID, item.CharacterID, notification); err != nil {
-		return fmt.Errorf("advance delivered notification %d cursor: %w", item.NotificationID, err)
-	}
-	if err := p.stateStore.DeletePending(ctx, item.NotificationID); err != nil {
-		return fmt.Errorf("delete delivered notification %d retry: %w", item.NotificationID, err)
-	}
-	return nil
-}
-
-func (p *Poller) pendingNotificationAlreadyAdvanced(
-	ctx context.Context,
-	item *notificationstate.PendingNotification,
-	notification *esi.Notification,
-) (bool, error) {
-	if item == nil || notification == nil {
-		return false, errors.New("pending notification and payload are required")
-	}
-	state, err := p.streamSnapshot(ctx, item.CorporationID, item.CharacterID)
-	if err != nil {
-		return false, fmt.Errorf("load cursor for pending notification %d: %w", item.NotificationID, err)
-	}
-	normalized := normalizeNotificationTimestamps([]esi.Notification{*notification}, time.Now().UTC())[0]
-	return !normalized.Timestamp.Before(state.lastTimestamp) && hasSeen(state.seenAtCursor, notification.ID), nil
-}
-
-func failedDestinationIDs(err error) []string {
-	deliveryErr, ok := errors.AsType[*alertservice.DeliveryError](err)
-	if !ok {
-		return nil
-	}
-	return append([]string(nil), deliveryErr.DestinationIDs...)
-}
-
-func retryErrorMessage(err error) string {
-	message := err.Error()
-	if len(message) > maxRetryErrorMessage {
-		return message[:maxRetryErrorMessage]
-	}
-	return message
-}
-
-func notificationRetryDelay(attempt int) time.Duration {
-	delay := notificationRetryBase
-	for i := 1; i < attempt; i++ {
-		if delay >= notificationRetryMax/2 {
-			return notificationRetryMax
-		}
-		delay *= 2
-	}
-	if delay > notificationRetryMax {
-		return notificationRetryMax
-	}
-	return delay
-}
-
-func retryExpired(item *notificationstate.PendingNotification, now time.Time) bool {
-	return !item.CreatedAt.IsZero() && !now.Before(item.CreatedAt.Add(maxNotificationRetryAge))
 }

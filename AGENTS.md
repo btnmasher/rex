@@ -262,11 +262,17 @@ When the user requests a durable behavior change, record it here or in the relev
   deduplication state are authoritative for deciding whether to deliver alerts.
 - `internal/token` owns the in-memory corporation access-token pool and rotation
   lifecycle. It must not query auth-next or persist token material.
-- Per-corporation token operations use context-aware keyed serialization; canceled
-  waiters must release their registry references and must not retain lock entries.
+- Per-corporation token rotation uses context-aware keyed serialization; canceled
+	  waiters must release their registry references and must not retain lock entries.
+	  Refresh fetches are coalesced and publish complete token snapshots atomically
+	  without holding the rotation lock during network I/O.
 - `internal/esi`, `internal/discord`, and `internal/tokenexport` own their
-  respective external API boundaries. Discord transport errors must remain
-  safe for logs and durable retry metadata while preserving unwrap behavior.
+	 respective external API boundaries. Discord transport errors must remain
+	 safe for logs and durable retry metadata while preserving unwrap behavior;
+	 transient transport failures are normalized as retryable outcomes while
+	 caller cancellation is not. Same-webhook requests may proceed concurrently
+	 with bounded in-process cooldown state applied after provider-reported
+	 backoff.
 - `internal/logging` owns logger construction and terminal-oriented pretty
   rendering. Pretty output is opt-in and TTY-aware; non-interactive output
   remains structured JSON.
@@ -280,25 +286,42 @@ When the user requests a durable behavior change, record it here or in the relev
   for maintenance and local alert-format testing. The service is deployed as
   a single instance; retry draining is not a distributed lease.
 - `internal/poller` owns one-minute corporation scheduling, cursors,
-  corporation-wide deduplication, and bounded delivery retries. Eligible
+  corporation-wide deduplication, pre-routing, and atomic delivery admission.
+  Eligible
   notifications are processed in timestamp order and stop at the first
-  persistence or delivery failure so the cursor cannot skip unresolved work;
-  future upstream timestamps are clamped to current UTC before cursor storage.
+  persistence failure so the cursor cannot skip unresolved work; future
+  upstream timestamps are clamped to current UTC before cursor storage.
+- `internal/routing` owns canonical selector compilation, pre/post destination
+  filtering, corporation filters, structure-type exclusions, and duplicate
+  target rejection.
+- `internal/enrichment` owns the provider-neutral enriched notification
+  context consumed by destination adapters.
+- `internal/delivery` owns the asynchronous queue worker, provider-neutral
+  outcomes, retry policy, cancellation, and terminal delivery cleanup. It must
+  not inspect provider payloads or perform alert filtering.
+- `jobruntime/scheduler` owns wall-clock-aligned periodic boundaries. Scheduled
+  callbacks are non-overlapping and skip boundaries missed during a running
+  callback rather than catching up.
 - `internal/notificationstate` owns the cursor-store contract; the SQLite
   implementation persists per-corporation character cursors, a global unique
   seen-notification ledger, bounded retry metadata/payloads, and 30-day alert
   history. Cared-for IDs are claimed atomically with their retry payload before
   delivery. Pending payload size validation is shared by all store
   implementations, and malformed durable retry rows are dropped while listing
-  due work. Alert history records only successful destination deliveries and
-  includes raw notification, classified event, and formatted Discord JSON; do
-  not persist webhook URLs or access tokens in this store. Globally seen
-  notification IDs are retained for one hour. The configured lookbehind is a
+  due work. Alert history records one terminal outcome per destination, including
+  status, terminal error, raw notification, classified event, and formatted
+  Discord JSON; do not persist webhook URLs or access tokens in this store.
+  Transient delivery failures remain in the retry queue until successful,
+  exhausted, or stale. Globally seen notification IDs are retained for one hour.
+  The configured lookbehind is a
   hard maximum age for fetched notifications; stale rows are marked seen and
   advance their character cursor without delivery. New streams use the same
   window when their initial cursor is created. Delivery retries carry their
   first-queued timestamp and are dropped, marked complete, and cursor-advanced
-  after thirty minutes.
+  after thirty minutes. Delivery history writes are retried independently a
+  bounded number of times after a successful send; a history write failure is
+  logged without redelivering the alert. Expired retries record all affected
+  destination IDs before queue deletion when the payload can be decoded.
 - `internal/esi` keeps process-local ETag and rate-limit state bounded
   with stale-entry and capacity eviction. Public universe lookups do not use
   conditional ETags because the client does not retain response bodies for a
@@ -331,8 +354,12 @@ When the user requests a durable behavior change, record it here or in the relev
   structure-type exclusions, while destination mappings are corporation-scoped
   and many-to-many. Corporation exclusions take precedence over inclusions;
   preserve both boundaries when extending notification routing.
-- Identical Discord webhook URLs are flattened at the alert delivery boundary;
-  one notification must produce at most one delivery per URL.
+- Accepted destination IDs are persisted with pending rows, so a retry after a
+  partial delivery does not resend destinations already accepted.
+- Identical Discord webhook URLs are flattened after post-routing filters are
+  applied; pre-routing retains every candidate because shared URLs can have
+  different destination filters. One notification must produce at most one
+  delivery per URL for the surviving targets.
 - Starbase notification routing uses the canonical `starbase` group with
   `starbase.under_attack` and `starbase.resource_alert` leaves. Canonical dot
   paths are the only supported alert selectors.
@@ -347,11 +374,16 @@ When the user requests a durable behavior change, record it here or in the relev
   required by this service.
 - The `access-token-refresh` job lists eligible corporations every fifteen
   minutes and fetches each corporation independently with bounded concurrency.
-  Up to fifteen token identities are retained per corporation, and normal
-  polling does not reuse an identity within ten minutes.
+  `AUTH_NEXT_TOKEN_EXPORT_COUNT` controls how many identities auth-next returns
+  per corporation, from 1 through 64, defaulting to 60. Up to sixty-four token
+  identities are retained per corporation, and normal polling does not reuse
+  an identity within ten minutes. The smoothing threshold is derived from the
+  configured poll interval, so a 30-second cadence requires twenty identities
+  before every cycle can proceed without stretching.
 - Alert links show hydrated names without parenthesized IDs by default;
-  `DISCORD_SHOW_ENTITY_IDS` enables IDs while unresolved IDs remain link
-  fallbacks.
+  destination `presentation.showEntityIDs` enables IDs while unresolved IDs
+  remain link fallbacks. Destination configuration is loaded from
+  `ALERT_DESTINATIONS_CONFIG` as strict versioned JSON or YAML.
 - Ownership-transfer alerts render previous and new corporation ownership
   separately, using hydrated names with EVEWho fallback links.
 - Structure alerts use the ESI payload's owner corporation when present. When a

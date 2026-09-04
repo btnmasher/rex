@@ -13,6 +13,13 @@ import (
 
 const maxPendingNotificationBytes = 256 << 10
 
+const (
+	// AlertDeliveryStatusDelivered identifies an alert accepted by Discord.
+	AlertDeliveryStatusDelivered = "delivered"
+	// AlertDeliveryStatusFailed identifies an alert permanently dropped after delivery retries.
+	AlertDeliveryStatusFailed = "failed"
+)
+
 // Stream is the per-character ESI cursor within one corporation.
 type Stream struct {
 	LastTimestamp time.Time          `json:"lastTimestamp"`
@@ -25,23 +32,54 @@ type Cursor struct {
 }
 
 // PendingNotification is a globally claimed notification awaiting delivery.
-// The serialized notification and failed destination IDs make retries survive
+// The serialized notification and destination progress make retries survive
 // process restarts without retaining access tokens or external clients.
 type PendingNotification struct {
-	NotificationID       int64
-	CorporationID        string
-	CorporationName      string
-	CorporationTicker    string
-	CharacterID          string
-	NotificationJSON     []byte
-	FailedDestinationIDs []string
-	Attempts             int
-	CreatedAt            time.Time
-	NextRetryAt          time.Time
-	LastError            string
+	NotificationID          int64
+	CorporationID           string
+	CorporationName         string
+	CorporationTicker       string
+	CharacterID             string
+	NotificationJSON        []byte
+	DestinationIDs          []string
+	DeliveredDestinationIDs []string
+	FailedDestinationIDs    []string
+	Attempts                int
+	CreatedAt               time.Time
+	NextRetryAt             time.Time
+	LastError               string
 }
 
-// AlertHistoryRecord captures one accepted Discord alert delivery without
+// Admission contains the notification and cursor state committed together.
+// Pending may be nil when the notification was filtered before delivery.
+type Admission struct {
+	NotificationID int64
+	CorporationID  string
+	Cursor         Cursor
+	Pending        *PendingNotification
+}
+
+// Validate checks that an admission has consistent notification and
+// corporation identity, including any pending delivery payload.
+func (a *Admission) Validate() error {
+	if a == nil || strings.TrimSpace(a.CorporationID) == "" {
+		return errors.New("notification admission is required")
+	}
+	if a.Pending != nil {
+		if err := a.Pending.Validate(); err != nil {
+			return err
+		}
+		if a.Pending.NotificationID != a.NotificationID || a.Pending.CorporationID != a.CorporationID {
+			return errors.New("notification admission and pending identities differ")
+		}
+	}
+	if a.NotificationID <= 0 {
+		return errors.New("notification admission identity is required")
+	}
+	return nil
+}
+
+// AlertHistoryRecord captures one terminal Discord delivery outcome without
 // retaining webhook credentials or EVE access tokens.
 type AlertHistoryRecord struct {
 	NotificationID      int64
@@ -52,13 +90,15 @@ type AlertHistoryRecord struct {
 	CorporationTicker   string
 	CharacterID         string
 	DestinationID       string
+	DeliveryStatus      string
+	DeliveryError       string
 	DispatchedAt        time.Time
 	RawNotificationJSON []byte
 	ClassifiedEventJSON []byte
 	DiscordPayloadJSON  []byte
 }
 
-// AlertHistory persists and lists successfully dispatched alert payloads.
+// AlertHistory persists and lists terminal alert delivery outcomes.
 type AlertHistory interface {
 	RecordAlert(context.Context, *AlertHistoryRecord) error
 	ListAlertHistory(context.Context, time.Time, int) ([]AlertHistoryRecord, error)
@@ -75,6 +115,15 @@ func (r *AlertHistoryRecord) Validate() error {
 	}
 	if strings.TrimSpace(r.CorporationID) == "" || strings.TrimSpace(r.CharacterID) == "" || strings.TrimSpace(r.DestinationID) == "" {
 		return errors.New("alert history delivery identity is incomplete")
+	}
+	switch r.DeliveryStatus {
+	case AlertDeliveryStatusDelivered:
+	case AlertDeliveryStatusFailed:
+		if strings.TrimSpace(r.DeliveryError) == "" {
+			return errors.New("failed alert history requires a delivery error")
+		}
+	default:
+		return errors.New("alert history delivery status is invalid")
 	}
 	if r.DispatchedAt.IsZero() {
 		return errors.New("alert history dispatch time is required")
@@ -110,7 +159,7 @@ type Store interface {
 	Load(context.Context, string) (Cursor, error)
 	Save(context.Context, string, Cursor) error
 	MarkSeen(context.Context, int64) (bool, error)
-	ClaimPending(context.Context, *PendingNotification) (bool, error)
+	Admit(context.Context, *Admission) (bool, error)
 	ListPending(context.Context, int, time.Time) ([]PendingNotification, error)
 	ReschedulePending(context.Context, *PendingNotification) error
 	DeletePending(context.Context, int64) error
@@ -133,7 +182,7 @@ func NewMemoryStore() *MemoryStore {
 
 // Load returns a cloned cursor or an empty cursor when none exists.
 func (s *MemoryStore) Load(ctx context.Context, corporationID string) (Cursor, error) {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return Cursor{}, err
 	}
 	s.mu.Lock()
@@ -147,7 +196,7 @@ func (s *MemoryStore) Load(ctx context.Context, corporationID string) (Cursor, e
 
 // Save replaces one corporation's cursor.
 func (s *MemoryStore) Save(ctx context.Context, corporationID string, value Cursor) error {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -158,7 +207,7 @@ func (s *MemoryStore) Save(ctx context.Context, corporationID string, value Curs
 
 // MarkSeen atomically claims a globally unique notification ID.
 func (s *MemoryStore) MarkSeen(ctx context.Context, notificationID int64) (bool, error) {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return false, err
 	}
 	s.mu.Lock()
@@ -170,32 +219,51 @@ func (s *MemoryStore) MarkSeen(ctx context.Context, notificationID int64) (bool,
 	return true, nil
 }
 
-// ClaimPending atomically claims a notification and stores its retry payload.
-func (s *MemoryStore) ClaimPending(ctx context.Context, pending *PendingNotification) (bool, error) {
+// Admit atomically marks a notification seen, persists its cursor, and stores
+// its pending delivery payload when one is supplied.
+func (s *MemoryStore) Admit(ctx context.Context, admission *Admission) (bool, error) {
+	if s == nil {
+		return false, errors.New("notification store is unavailable")
+	}
+	if ctx == nil {
+		return false, errors.New("notification admission context is required")
+	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if err := pending.Validate(); err != nil {
+	notificationID, err := validateAdmission(admission)
+	if err != nil {
 		return false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.seen[pending.NotificationID]; ok {
+	if _, ok := s.seen[notificationID]; ok {
+		s.values[admission.CorporationID] = clone(admission.Cursor)
 		return false, nil
 	}
 	now := time.Now().UTC()
-	s.seen[pending.NotificationID] = now
-	pendingCopy := clonePending(pending)
-	if pendingCopy.CreatedAt.IsZero() {
-		pendingCopy.CreatedAt = now
+	s.seen[notificationID] = now
+	if pending := admission.Pending; pending != nil {
+		pendingCopy := clonePending(pending)
+		if pendingCopy.CreatedAt.IsZero() {
+			pendingCopy.CreatedAt = now
+		}
+		s.pending[pending.NotificationID] = pendingCopy
 	}
-	s.pending[pending.NotificationID] = pendingCopy
-	return true, nil
+	s.values[admission.CorporationID] = clone(admission.Cursor)
+	return admission.Pending != nil, nil
+}
+
+func validateAdmission(admission *Admission) (int64, error) {
+	if err := admission.Validate(); err != nil {
+		return 0, err
+	}
+	return admission.NotificationID, nil
 }
 
 // ListPending returns due retry payloads in deterministic order.
 func (s *MemoryStore) ListPending(ctx context.Context, limit int, now time.Time) ([]PendingNotification, error) {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -216,7 +284,7 @@ func (s *MemoryStore) ListPending(ctx context.Context, limit int, now time.Time)
 
 // ReschedulePending updates retry metadata for one pending notification.
 func (s *MemoryStore) ReschedulePending(ctx context.Context, pending *PendingNotification) error {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return err
 	}
 	if err := pending.Validate(); err != nil {
@@ -233,7 +301,7 @@ func (s *MemoryStore) ReschedulePending(ctx context.Context, pending *PendingNot
 
 // DeletePending removes a completed or permanently failed notification retry.
 func (s *MemoryStore) DeletePending(ctx context.Context, notificationID int64) error {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -244,7 +312,7 @@ func (s *MemoryStore) DeletePending(ctx context.Context, notificationID int64) e
 
 // PruneSeen removes IDs older than the supplied retention boundary.
 func (s *MemoryStore) PruneSeen(ctx context.Context, before time.Time) error {
-	if err := ctx.Err(); err != nil {
+	if err := s.validateContext(ctx); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -266,8 +334,20 @@ func clonePending(value *PendingNotification) PendingNotification {
 	}
 	clone := *value
 	clone.NotificationJSON = append([]byte(nil), value.NotificationJSON...)
+	clone.DestinationIDs = append([]string(nil), value.DestinationIDs...)
+	clone.DeliveredDestinationIDs = append([]string(nil), value.DeliveredDestinationIDs...)
 	clone.FailedDestinationIDs = append([]string(nil), value.FailedDestinationIDs...)
 	return clone
+}
+
+func (s *MemoryStore) validateContext(ctx context.Context) error {
+	if s == nil {
+		return errors.New("notification store is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("notification store context is required")
+	}
+	return ctx.Err()
 }
 
 func sortPending(items []PendingNotification) {

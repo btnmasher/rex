@@ -161,6 +161,7 @@ func WithProducer(producer Producer) RunnerOption {
 	}
 }
 
+// NewRunner creates a runner backed by the supplied store and work-item codec.
 func NewRunner[W RuntimeItem](
 	store jobstore.Store,
 	codec WorkItemCodec[W],
@@ -236,6 +237,12 @@ func (r *Runner[W]) RegisterSteps(steps []StepDefinition[W]) error {
 
 // StartOrResumeRun acquires a run slot and processes it to completion.
 func (r *Runner[W]) StartOrResumeRun(ctx context.Context, p *Params) (runID string, err error) {
+	if r == nil {
+		return "", errors.New("job runner is required")
+	}
+	if ctx == nil {
+		return "", errors.New("job runner context is required")
+	}
 	defer func() {
 		if panicValue := recover(); panicValue != nil {
 			err = r.handleRunPanic(ctx, runID, panicValue, debug.Stack())
@@ -253,7 +260,6 @@ func (r *Runner[W]) StartOrResumeRun(ctx context.Context, p *Params) (runID stri
 		TriggerMeta:   p.Trigger.Meta,
 		RetryGroupID:  p.RetryGroupID,
 	})
-
 	if err != nil {
 		return "", err
 	}
@@ -283,6 +289,12 @@ func (r *Runner[W]) StartOrResumeRun(ctx context.Context, p *Params) (runID stri
 
 // RunRetryGroup executes items associated with an existing retry group.
 func (r *Runner[W]) RunRetryGroup(ctx context.Context, retryGroupID string) (runID string, err error) {
+	if r == nil {
+		return "", errors.New("job runner is required")
+	}
+	if ctx == nil {
+		return "", errors.New("job runner context is required")
+	}
 	defer func() {
 		if panicValue := recover(); panicValue != nil {
 			panicErr := r.handleRunPanic(ctx, runID, panicValue, debug.Stack())
@@ -371,6 +383,12 @@ func (r *Runner[W]) markRunFailedAfterPanic(ctx context.Context, runID string, r
 
 // RunOnce performs a single stage+claim+process iteration for a run.
 func (r *Runner[W]) RunOnce(ctx context.Context, runID string) (err error) {
+	if r == nil {
+		return errors.New("job runner is required")
+	}
+	if ctx == nil {
+		return errors.New("job runner context is required")
+	}
 	defer func() {
 		if panicValue := recover(); panicValue != nil {
 			err = r.handleRunPanic(ctx, runID, panicValue, debug.Stack())
@@ -394,7 +412,6 @@ func (r *Runner[W]) RunOnce(ctx context.Context, runID string) (err error) {
 		RetryGroupID: nil,
 		BatchSize:    r.config.WorkBatchSize,
 	})
-
 	if err != nil {
 		return &PipelineError{
 			Stage: "ITEM_CLAIM",
@@ -422,10 +439,16 @@ func (r *Runner[W]) RunOnce(ctx context.Context, runID string) (err error) {
 
 // RunToCompletion repeatedly processes iterations until no more items remain.
 func (r *Runner[W]) RunToCompletion(ctx context.Context, meta *JobMeta, retryGroupID *string) (err error) {
-	runID := ""
-	if meta != nil {
-		runID = meta.RunID
+	if r == nil {
+		return errors.New("job runner is required")
 	}
+	if ctx == nil {
+		return errors.New("job runner context is required")
+	}
+	if meta == nil {
+		return errors.New("job metadata is required")
+	}
+	runID := meta.RunID
 	defer func() {
 		if panicValue := recover(); panicValue != nil {
 			err = r.handleRunPanic(ctx, runID, panicValue, debug.Stack())
@@ -461,7 +484,6 @@ func (r *Runner[W]) runToCompletionIteration(ctx context.Context, meta *JobMeta,
 		RetryGroupID: retryGroupID,
 		BatchSize:    r.config.WorkBatchSize,
 	})
-
 	if err != nil {
 		return false, &PipelineError{Stage: "ITEM_CLAIM", Err: err}
 	}
@@ -512,7 +534,6 @@ func (r *Runner[W]) produceItemsIfNeeded(ctx context.Context, meta *JobMeta, ret
 		Checkpoint: checkpoint,
 		BatchSize:  r.config.ProduceBatchSize,
 	})
-
 	if err != nil {
 		return false, &PipelineError{Stage: "PRODUCE", Err: err}
 	}

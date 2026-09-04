@@ -10,9 +10,12 @@ import (
 	"time"
 
 	"github.com/btnmasher/rex/internal/authnextdb"
+	deliverypkg "github.com/btnmasher/rex/internal/delivery"
 	"github.com/btnmasher/rex/internal/discord"
+	"github.com/btnmasher/rex/internal/enrichment"
 	"github.com/btnmasher/rex/internal/notifications"
 	"github.com/btnmasher/rex/internal/notificationstate"
+	"github.com/btnmasher/rex/internal/routing"
 )
 
 type alertTestDatabase struct {
@@ -85,6 +88,11 @@ type alertTestHistory struct {
 	records []notificationstate.AlertHistoryRecord
 }
 
+type retryingAlertHistory struct {
+	attempts   int
+	failBefore int
+}
+
 func (h *alertTestHistory) RecordAlert(_ context.Context, record *notificationstate.AlertHistoryRecord) error {
 	h.records = append(h.records, *record)
 	return nil
@@ -92,6 +100,29 @@ func (h *alertTestHistory) RecordAlert(_ context.Context, record *notificationst
 
 func (h *alertTestHistory) ListAlertHistory(context.Context, time.Time, int) ([]notificationstate.AlertHistoryRecord, error) {
 	return append([]notificationstate.AlertHistoryRecord(nil), h.records...), nil
+}
+
+func (h *retryingAlertHistory) RecordAlert(context.Context, *notificationstate.AlertHistoryRecord) error {
+	h.attempts++
+	if h.attempts <= h.failBefore {
+		return errors.New("history unavailable")
+	}
+	return nil
+}
+
+func (h *retryingAlertHistory) ListAlertHistory(context.Context, time.Time, int) ([]notificationstate.AlertHistoryRecord, error) {
+	return nil, nil
+}
+
+func TestRecordHistoryRetriesWithoutRepeatingDelivery(t *testing.T) {
+	history := &retryingAlertHistory{failBefore: 2}
+	record := &notificationstate.AlertHistoryRecord{NotificationID: 1}
+	if err := recordHistoryWithRetry(context.Background(), history, record); err != nil {
+		t.Fatalf("record history: %v", err)
+	}
+	if history.attempts != 3 {
+		t.Fatalf("history attempts = %d, want 3", history.attempts)
+	}
 }
 
 func TestDeliverRecordsOnlyAcceptedDestinationPayloads(t *testing.T) {
@@ -120,8 +151,45 @@ func TestDeliverRecordsOnlyAcceptedDestinationPayloads(t *testing.T) {
 	if err == nil || len(history.records) != 1 {
 		t.Fatalf("expected one successful history record, err=%v records=%d", err, len(history.records))
 	}
-	if history.records[0].DestinationID != "a" || len(history.records[0].RawNotificationJSON) == 0 || len(history.records[0].DiscordPayloadJSON) == 0 {
+	if history.records[0].DestinationID != "a" || history.records[0].DeliveryStatus != notificationstate.AlertDeliveryStatusDelivered ||
+		history.records[0].DeliveryError != "" || len(history.records[0].RawNotificationJSON) == 0 || len(history.records[0].DiscordPayloadJSON) == 0 {
 		t.Fatalf("unexpected history record: %+v", history.records[0])
+	}
+}
+
+func TestRecordTerminalFailureRendersEachDestinationPayload(t *testing.T) {
+	history := &alertTestHistory{}
+	service, err := NewService(emptyStructureAlertDatabase{}, &alertTestDelivery{}, &Config{
+		Destinations: []Destination{
+			{ID: "without-ids", AlertTypes: []string{notifications.AlertStructureUnderAttack}, WebhookTargets: []WebhookTarget{{ID: "without-ids/primary", URL: "https://webhook-a"}}},
+			{ID: "with-ids", AlertTypes: []string{notifications.AlertStructureUnderAttack}, Presentation: Presentation{ShowEntityIDs: true}, WebhookTargets: []WebhookTarget{{ID: "with-ids/primary", URL: "https://webhook-b"}}},
+		},
+		History: history,
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	view := &enrichment.Context{
+		PollingCorporationID:   "100",
+		PollingCorporationName: "Corp",
+		CharacterID:            "900000001",
+		Event: notifications.Event{
+			NotificationID:   1,
+			NotificationType: "StructureUnderAttack",
+			AlertType:        notifications.AlertStructureUnderAttack,
+			SystemID:         "30000142",
+		},
+		SystemName:          "Jita",
+		RawNotificationJSON: []byte(`{"notification_id":1}`),
+	}
+	if err := service.RecordTerminalFailure(context.Background(), view, []string{"without-ids/primary", "with-ids/primary"}, errors.New("delivery failed")); err != nil {
+		t.Fatalf("record terminal failure: %v", err)
+	}
+	if len(history.records) != 2 || history.records[0].DestinationID != "without-ids/primary" || history.records[1].DestinationID != "with-ids/primary" {
+		t.Fatalf("unexpected terminal history records: %#v", history.records)
+	}
+	if bytes.Equal(history.records[0].DiscordPayloadJSON, history.records[1].DiscordPayloadJSON) {
+		t.Fatal("terminal history reused one destination's Discord payload")
 	}
 }
 
@@ -185,6 +253,31 @@ func TestDeliverLogsRawPayloadWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestDeliverTargetLogsRawPayloadWhenEnabled(t *testing.T) {
+	var output bytes.Buffer
+	service, err := NewService(emptyStructureAlertDatabase{}, &alertTestDelivery{}, &Config{
+		Destinations: []Destination{{
+			ID:          "structure-alerts",
+			AlertTypes:  []string{notifications.AlertStructureUnderAttack},
+			WebhookURLs: []string{"https://webhook-a"},
+		}},
+		LogPayloads: true,
+		Logger:      slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	if outcome := service.DeliverTarget(context.Background(), &enrichment.Context{
+		Event:               notifications.Event{NotificationID: 1, AlertType: notifications.AlertStructureUnderAttack},
+		RawNotificationJSON: []byte(`{"type":"StructureUnderAttack"}`),
+	}, "structure-alerts"); outcome.Status != deliverypkg.OutcomeAccepted {
+		t.Fatalf("deliver target outcome: %+v", outcome)
+	}
+	if !strings.Contains(output.String(), "raw_payload=") || !strings.Contains(output.String(), "StructureUnderAttack") {
+		t.Fatalf("expected raw payload in target debug log: %q", output.String())
+	}
+}
+
 func (d *alertTestDelivery) Deliver(_ context.Context, destination discord.Destination, message *discord.Message) error {
 	d.urls = append(d.urls, destination.WebhookURL)
 	d.messages = append(d.messages, *message)
@@ -199,9 +292,11 @@ func TestDeliverReportsOnlyFailedDestinations(t *testing.T) {
 	service, err := NewService(alertTestDatabase{}, delivery, &Config{
 		Destinations: []Destination{
 			{
-				ID:          "a",
-				AlertTypes:  []string{notifications.AlertStructureUnderAttack},
-				WebhookURLs: []string{"https://webhook-a"},
+				ID:              "a",
+				AlertTypes:      []string{notifications.AlertStructureUnderAttack},
+				WebhookURLs:     []string{"https://webhook-a"},
+				SenderName:      "Rex",
+				SenderAvatarURL: "https://images.example.invalid/rex.png",
 			},
 			{
 				ID:          "b",
@@ -209,8 +304,6 @@ func TestDeliverReportsOnlyFailedDestinations(t *testing.T) {
 				WebhookURLs: []string{"https://webhook-b"},
 			},
 		},
-		OverrideSenderName:      "Rex",
-		OverrideSenderAvatarURL: "https://images.example.invalid/rex.png",
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -228,7 +321,7 @@ func TestDeliverReportsOnlyFailedDestinations(t *testing.T) {
 		t.Fatalf("expected both destinations to be attempted, got %v", delivery.urls)
 	}
 	if delivery.messages[0].Username != "Rex" || delivery.messages[0].AvatarURL != "https://images.example.invalid/rex.png" {
-		t.Fatalf("expected global sender configuration, got %#v", delivery.messages[0])
+		t.Fatalf("expected sender configuration, got %#v", delivery.messages[0])
 	}
 	if delivery.messages[0].Embeds[0].Color != colorDanger {
 		t.Fatalf("unexpected canonical embed color: %#v", delivery.messages[0].Embeds[0].Color)
@@ -303,8 +396,20 @@ func TestSupportsAlertGroupsAndLeafExclusions(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := supports(test.configured, test.excluded, test.alertType); got != test.want {
-				t.Fatalf("supports() = %t, want %t", got, test.want)
+			policy, err := routing.New([]routing.Destination{{
+				ID:        "test",
+				TargetIDs: []string{"target"},
+				Filters: routing.Filters{
+					AlertTypes:        test.configured,
+					ExcludeAlertTypes: test.excluded,
+				},
+			}})
+			if err != nil {
+				t.Fatalf("new routing policy: %v", err)
+			}
+			got := len(policy.PreRoute("100", test.alertType)) > 0
+			if got != test.want {
+				t.Fatalf("routing policy selected target = %t, want %t", got, test.want)
 			}
 		})
 	}
@@ -364,6 +469,79 @@ func TestDeliverDeduplicatesSharedWebhookURLsAcrossDestinations(t *testing.T) {
 	}
 	if len(delivery.urls) != 1 || delivery.urls[0] != "https://webhook-shared" {
 		t.Fatalf("expected one delivery for shared webhook URL, got %#v", delivery.urls)
+	}
+}
+
+func TestPostRouteDeduplicatesSharedWebhookURLs(t *testing.T) {
+	service, err := NewService(emptyStructureAlertDatabase{}, &alertTestDelivery{}, &Config{
+		Destinations: []Destination{
+			{
+				ID:         "military-alerts",
+				AlertTypes: []string{notifications.AlertStructureUnderAttack},
+				WebhookTargets: []WebhookTarget{{
+					ID:  "military-alerts/primary",
+					URL: "https://webhook-shared",
+				}},
+			},
+			{
+				ID:         "logistics-alerts",
+				AlertTypes: []string{notifications.AlertStructureUnderAttack},
+				WebhookTargets: []WebhookTarget{{
+					ID:  "logistics-alerts/primary",
+					URL: "https://webhook-shared",
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	got := service.PreRoute(&enrichment.Envelope{
+		Corporation: authnextdb.Corporation{ID: "100"},
+		Event:       notifications.Event{AlertType: notifications.AlertStructureUnderAttack},
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected both targets before post-routing, got %#v", got)
+	}
+	postRouted := service.PostRoute(&enrichment.Context{PollingCorporationID: "100", Event: notifications.Event{
+		AlertType: notifications.AlertStructureUnderAttack,
+	}}, got)
+	if len(postRouted) != 1 || postRouted[0] != "military-alerts/primary" {
+		t.Fatalf("expected one target after shared webhook URL deduplication, got %#v", postRouted)
+	}
+}
+
+func TestPostRouteRetainsSharedWebhookWhenFirstTargetIsExcluded(t *testing.T) {
+	service, err := NewService(emptyStructureAlertDatabase{}, &alertTestDelivery{}, &Config{
+		Destinations: []Destination{
+			{
+				ID:                      "excluded",
+				AlertTypes:              []string{notifications.AlertStructureUnderAttack},
+				ExcludeStructureTypeIDs: []string{"85230"},
+				WebhookTargets:          []WebhookTarget{{ID: "excluded/primary", URL: "https://webhook-shared"}},
+			},
+			{
+				ID:             "included",
+				AlertTypes:     []string{notifications.AlertStructureUnderAttack},
+				WebhookTargets: []WebhookTarget{{ID: "included/primary", URL: "https://webhook-shared"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	candidates := service.PreRoute(&enrichment.Envelope{
+		Corporation: authnextdb.Corporation{ID: "100"},
+		Event:       notifications.Event{AlertType: notifications.AlertStructureUnderAttack},
+	})
+	postRouted := service.PostRoute(&enrichment.Context{PollingCorporationID: "100", Event: notifications.Event{
+		AlertType:       notifications.AlertStructureUnderAttack,
+		StructureTypeID: "85230",
+	}}, candidates)
+	if len(postRouted) != 1 || postRouted[0] != "included/primary" {
+		t.Fatalf("expected included target after post-routing, got %#v", postRouted)
 	}
 }
 
@@ -485,6 +663,36 @@ func TestDeliverFiltersDestinationByEnrichedStructureType(t *testing.T) {
 	}
 	if len(delivery.urls) != 0 {
 		t.Fatalf("expected enriched structure type to filter delivery: %#v", delivery.urls)
+	}
+}
+
+func TestDeliverFiltersBulkStructureTypeFromPayloadBeforeDatabase(t *testing.T) {
+	delivery := &alertTestDelivery{}
+	service, err := NewService(emptyStructureAlertDatabase{}, delivery, &Config{
+		Destinations: []Destination{
+			{ID: "filtered", WebhookURLs: []string{"https://webhook-filtered"}, AlertTypes: []string{notifications.AlertStructuresReinforcementChanged}, ExcludeStructureTypeIDs: []string{"81826"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	err = service.Deliver(context.Background(), &DeliveryRequest{
+		Corporation: authnextdb.Corporation{ID: "100", Name: "Polling Corporation"},
+		Event: &notifications.Event{
+			NotificationID:   1,
+			NotificationType: "StructuresReinforcementChanged",
+			AlertType:        notifications.AlertStructuresReinforcementChanged,
+			StructureReferences: []notifications.StructureReference{
+				{ID: "1050629404880", TypeID: "81826"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("deliver bulk structure alert: %v", err)
+	}
+	if len(delivery.urls) != 0 {
+		t.Fatalf("expected payload structure type to filter delivery: %#v", delivery.urls)
 	}
 }
 
@@ -645,11 +853,20 @@ func TestBuildEventViewGroupsBulkReinforcementCoverage(t *testing.T) {
 		{ID: "1050629404882", TypeID: "35833", TypeName: &thirdTypeName, SystemID: "30002901", SystemName: &firstSystem, RegionID: &regionID, RegionName: &region},
 		{ID: "1052657361104", TypeID: "35832", TypeName: &secondTypeName, SystemID: "30002902", SystemName: &secondSystem, RegionID: &regionID, RegionName: &region},
 	}}
-	service := &Service{database: database, logger: slog.Default()}
+	service, err := NewService(database, &alertTestDelivery{}, &Config{})
+	if err != nil {
+		t.Fatalf("new alert service: %v", err)
+	}
 	view, err := service.buildEventView(context.Background(), &DeliveryRequest{Corporation: authnextdb.Corporation{ID: "999", Name: "Polling Corporation"}, Event: &notifications.Event{
-		NotificationType:         "StructuresReinforcementChanged",
-		AlertType:                notifications.AlertStructuresReinforcementChanged,
-		StructureIDs:             []string{"1050629404880", "1050629404881", "1050629404882", "1052657361104"},
+		NotificationType: "StructuresReinforcementChanged",
+		AlertType:        notifications.AlertStructuresReinforcementChanged,
+		StructureIDs:     []string{"1050629404880", "1050629404881", "1050629404882", "1052657361104"},
+		StructureReferences: []notifications.StructureReference{
+			{ID: "1050629404880", Name: "ZJET-E - VI - 13", TypeID: "81826"},
+			{ID: "1050629404881", Name: "ZJET-E - VI - 14", TypeID: "81826"},
+			{ID: "1050629404882", Name: "ZJET-E - 4-1", TypeID: "35833"},
+			{ID: "1052657361104", Name: "EL8-4Q - 4-1", TypeID: "35832"},
+		},
 		ReinforcedStructureCount: &count,
 		ReinforcementWeekday:     &weekday,
 	}})
@@ -664,7 +881,7 @@ func TestBuildEventViewGroupsBulkReinforcementCoverage(t *testing.T) {
 	if embed.Description != "The reinforcement schedule changed for 53 structures across 2 solar systems." {
 		t.Fatalf("unexpected description: %q", embed.Description)
 	}
-	if !hasField(embed.Fields, "Structure Coverage", "[Pure Blind](https://evemaps.dotlan.net/region/Pure_Blind)\n  [ZJET-E](https://evemaps.dotlan.net/system/ZJET-E)\n    Metenox Moon Drill - 2 structures\n    Raitaru - 1 structure\n  [EL8-4Q](https://evemaps.dotlan.net/system/EL8-4Q)\n    Astrahus - 1 structure") {
+	if !hasField(embed.Fields, "Structure Coverage", "**[Pure Blind](https://evemaps.dotlan.net/region/Pure_Blind)**\n- **[ZJET-E](https://evemaps.dotlan.net/system/ZJET-E)**\n  - **Metenox Moon Drill** (2 structures)\n    - ZJET-E - VI - 13\n    - ZJET-E - VI - 14\n  - **Raitaru** (1 structure)\n    - ZJET-E - 4-1\n- **[EL8-4Q](https://evemaps.dotlan.net/system/EL8-4Q)**\n  - **Astrahus** (1 structure)\n    - EL8-4Q - 4-1") {
 		t.Fatalf("missing structure coverage summary: %#v", embed.Fields)
 	}
 	if !hasField(embed.Fields, "Reinforcement Schedule", "Structures: 53\nWeekday: Unchanged") {

@@ -98,15 +98,16 @@ const (
 )
 
 var (
-	structureIDPattern         = regexp.MustCompile(`(?i)(?:structure[_ -]?id|structureid)\D{0,24}(\d{5,})`)
-	bulkStructureIDPattern     = regexp.MustCompile(`(?:^|\s)-\s*-\s*(\d{5,})(?:\s|$)`)
-	systemIDPattern            = regexp.MustCompile(`(?i)(?:solar[_ -]?system[_ -]?id|system[_ -]?id|solarsystemid)\D{0,24}(\d{5,})`)
-	numberPattern              = regexp.MustCompile(`\d+`)
-	selectorSegmentPattern     = regexp.MustCompile(`^[a-z0-9_]+$`)
-	metadataKeyPattern         = regexp.MustCompile(`(?i)(?:aggressorAllianceID|aggressorAllianceName|aggressorCharacterID|aggressorCorpID|aggressorCorporationName|aggressorID|allStructureInfo|allianceID|allianceName|armorPercentage|armorValue|assetSafetyDurationFull|assetSafetyDurationMinimum|assetSafetyFullTimestamp|assetSafetyMinimumTimestamp|autoTime|campaignEventType|cancelledBy|charID|charName|characterID|characterName|corpID|corpLinkData|corpName|daysUntilAbandon|decloakTime|destructTime|firedBy|hullPercentage|hullValue|hour|isActive|isCorpOwned|itemID|listOfServiceModuleIDs|listOfTypesAndQty|mercenaryDenShowInfoData|moonID|moonLink|newOwnerCorpID|newOwnerCorpName|newStationID|numStructures|oldOwnerCorpID|oldOwnerCorpName|oreVolumeByType|ownerCorpLinkData|ownerCorpName|planetID|planetTypeID|readyTime|reinforceExitTime|shieldLevel|shieldPercentage|shieldValue|solarSystemID|solarSystemLink|solarsystemID|startedBy|startedByLink|structureID|structureLink|structureName|structureShowInfoData|structureTypeID|structuresReinforcementChanged|timeLeft|timestamp|timestampEntered|timestampExited|typeID|vulnerableTime|weekday|wants)\s*:`)
-	resourceRequirementPattern = regexp.MustCompile(`(?i)quantity\s*:\s*(\d+)\s+typeID\s*:\s*(\d+)`)
-	tagPattern                 = regexp.MustCompile(`<[^>]+>`)
-	spacePattern               = regexp.MustCompile(`\s+`)
+	structureIDPattern            = regexp.MustCompile(`(?i)(?:structure[_ -]?id|structureid)\D{0,24}(\d{5,})`)
+	bulkStructureIDPattern        = regexp.MustCompile(`(?:^|\s)-\s*-\s*(\d{5,})(?:\s|$)`)
+	bulkStructureInfoEntryPattern = regexp.MustCompile(`^\s*(?:-\s*-\s*)?(\d{5,})\s*-\s*(.*?)\s*-\s*(\d+)\s*$`)
+	systemIDPattern               = regexp.MustCompile(`(?i)(?:solar[_ -]?system[_ -]?id|system[_ -]?id|solarsystemid)\D{0,24}(\d{5,})`)
+	numberPattern                 = regexp.MustCompile(`\d+`)
+	selectorSegmentPattern        = regexp.MustCompile(`^[a-z0-9_]+$`)
+	metadataKeyPattern            = regexp.MustCompile(`(?i)(?:aggressorAllianceID|aggressorAllianceName|aggressorCharacterID|aggressorCorpID|aggressorCorporationName|aggressorID|allStructureInfo|allianceID|allianceName|armorPercentage|armorValue|assetSafetyDurationFull|assetSafetyDurationMinimum|assetSafetyFullTimestamp|assetSafetyMinimumTimestamp|autoTime|campaignEventType|cancelledBy|charID|charName|characterID|characterName|corpID|corpLinkData|corpName|daysUntilAbandon|decloakTime|destructTime|firedBy|hullPercentage|hullValue|hour|isActive|isCorpOwned|itemID|listOfServiceModuleIDs|listOfTypesAndQty|mercenaryDenShowInfoData|moonID|moonLink|newOwnerCorpID|newOwnerCorpName|newStationID|numStructures|oldOwnerCorpID|oldOwnerCorpName|oreVolumeByType|ownerCorpLinkData|ownerCorpName|planetID|planetTypeID|readyTime|reinforceExitTime|shieldLevel|shieldPercentage|shieldValue|solarSystemID|solarSystemLink|solarsystemID|startedBy|startedByLink|structureID|structureLink|structureName|structureShowInfoData|structureTypeID|structuresReinforcementChanged|timeLeft|timestamp|timestampEntered|timestampExited|typeID|vulnerableTime|weekday|wants)\s*:`)
+	resourceRequirementPattern    = regexp.MustCompile(`(?i)quantity\s*:\s*(\d+)\s+typeID\s*:\s*(\d+)`)
+	tagPattern                    = regexp.MustCompile(`<[^>]+>`)
+	spacePattern                  = regexp.MustCompile(`\s+`)
 )
 
 var displayNames = map[string]string{
@@ -172,6 +173,13 @@ type ResourceRequirement struct {
 	TypeID   string `json:"type_id"`
 }
 
+// StructureReference identifies a structure reported by a bulk notification.
+type StructureReference struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	TypeID string `json:"type_id"`
+}
+
 // Event is a classified notification ready for enrichment and delivery.
 type Event struct {
 	NotificationID           int64                 `json:"notification_id"`
@@ -181,6 +189,7 @@ type Event struct {
 	Timestamp                time.Time             `json:"timestamp"`
 	AlertType                string                `json:"alert_type"`
 	StructureIDs             []string              `json:"structure_ids"`
+	StructureReferences      []StructureReference  `json:"structure_references"`
 	SystemID                 string                `json:"system_id"`
 	AllianceID               string                `json:"alliance_id"`
 	AllianceName             string                `json:"alliance_name"`
@@ -436,8 +445,12 @@ func Classify(notification *esi.Notification) (Event, bool) {
 	text := PlainText(notification.Text)
 	metadata := extractMetadata(text)
 	structureIDs := uniqueMatches(structureIDPattern, text)
+	structureReferences := parseBulkStructureReferences(metadata["allstructureinfo"])
 	if notification.Type == "StructuresReinforcementChanged" {
-		structureIDs = uniqueMatchesLimit(bulkStructureIDPattern, metadata["allstructureinfo"], maxBulkStructureIDs)
+		structureIDs = structureReferenceIDs(structureReferences)
+		if len(structureIDs) == 0 {
+			structureIDs = uniqueMatchesLimit(bulkStructureIDPattern, metadata["allstructureinfo"], maxBulkStructureIDs)
+		}
 	}
 	if structureID := structureIDFromMetadata(metadata["structureid"]); structureID != "" {
 		structureIDs = []string{structureID}
@@ -455,6 +468,9 @@ func Classify(notification *esi.Notification) (Event, bool) {
 	if structureTypeID == "" {
 		structureTypeID = firstNumber(metadata["typeid"])
 	}
+	if structureTypeID == "" && len(structureReferences) == 1 {
+		structureTypeID = structureReferences[0].TypeID
+	}
 	ownerCorporationID, ownerCorporationName := ownerMetadata(notification.Type, metadata)
 	attackerCharacterID, attackerCharacterName, attackerCorporationID, attackerCorporationName := attackerMetadata(notification.Type, metadata)
 	attackerAllianceID := firstNumber(metadata["aggressorallianceid"])
@@ -469,6 +485,7 @@ func Classify(notification *esi.Notification) (Event, bool) {
 		Timestamp:                notification.Timestamp,
 		AlertType:                definition.leaf,
 		StructureIDs:             structureIDs,
+		StructureReferences:      structureReferences,
 		SystemID:                 systemID,
 		AllianceID:               firstNumber(metadata["allianceid"]),
 		AllianceName:             allianceName,
@@ -657,6 +674,49 @@ func PlainText(value string) string {
 
 func uniqueMatches(pattern *regexp.Regexp, value string) []string {
 	return uniqueMatchesLimit(pattern, value, maxStructureIDs)
+}
+
+func parseBulkStructureReferences(value string) []StructureReference {
+	if value == "" {
+		return nil
+	}
+	entries := strings.Split(value, " - - ")
+	references := make([]StructureReference, 0, min(len(entries), maxBulkStructureIDs))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		match := bulkStructureInfoEntryPattern.FindStringSubmatch(entry)
+		if len(match) < regexSubmatchCount+2 {
+			continue
+		}
+		id := strings.TrimSpace(match[1])
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		name := strings.TrimSpace(match[2])
+		typeID := strings.TrimSpace(match[3])
+		if id == "" || typeID == "" {
+			continue
+		}
+		seen[id] = struct{}{}
+		references = append(references, StructureReference{ID: id, Name: name, TypeID: typeID})
+		if len(references) == maxBulkStructureIDs {
+			break
+		}
+	}
+	return references
+}
+
+func structureReferenceIDs(references []StructureReference) []string {
+	if len(references) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(references))
+	for _, reference := range references {
+		if reference.ID != "" {
+			ids = append(ids, reference.ID)
+		}
+	}
+	return ids
 }
 
 func uniqueMatchesLimit(pattern *regexp.Regexp, value string, limit int) []string {

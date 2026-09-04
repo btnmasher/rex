@@ -60,26 +60,14 @@ func runDiscordDebug(ctx context.Context) error {
 		&http.Client{Timeout: debugHTTPTimeout},
 		discord.WithLogger(logger),
 	)
-	destinations := make([]alerts.Destination, 0, len(alertConfig.AlertDestinations))
-	for i := range alertConfig.AlertDestinations {
-		destination := &alertConfig.AlertDestinations[i]
-		destinations = append(destinations, alerts.Destination{
-			ID:                      destination.Name,
-			WebhookURLs:             destination.WebhookURLs,
-			AlertTypes:              destination.AlertTypes,
-			ExcludeAlertTypes:       destination.ExcludeAlertTypes,
-			ExcludeStructureTypeIDs: destination.ExcludeStructureTypeIDs,
-			IncludeCorporationIDs:   destination.IncludeCorporationIDs,
-			ExcludeCorporationIDs:   destination.ExcludeCorporationIDs,
-		})
+	destinations, err := alerts.DestinationsFromConfig(alertConfig.AlertDestinations)
+	if err != nil {
+		return err
 	}
 	alertService, err := alerts.NewService(debugDatabase{}, delivery, &alerts.Config{
-		Destinations:            destinations,
-		OverrideSenderName:      alertConfig.DiscordOverrideSenderName,
-		OverrideSenderAvatarURL: alertConfig.DiscordOverrideSenderAvatarURL,
-		ShowEntityIDs:           alertConfig.DiscordShowEntityIDs,
-		LogPayloads:             alertConfig.LogPayloads,
-		Logger:                  logger,
+		Destinations: destinations,
+		LogPayloads:  alertConfig.LogPayloads,
+		Logger:       logger,
 	})
 	if err != nil {
 		return err

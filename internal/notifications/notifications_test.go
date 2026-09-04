@@ -572,6 +572,9 @@ func assertReinforcementSchedule(t *testing.T, event *Event) {
 	if len(event.StructureIDs) != 2 || event.StructureIDs[0] != "1050629404880" || event.StructureIDs[1] != "1052657361104" {
 		t.Fatalf("unexpected bulk structure IDs: %#v", event.StructureIDs)
 	}
+	if len(event.StructureReferences) != 2 || event.StructureReferences[0] != (StructureReference{ID: "1050629404880", Name: "ZJET-E - VI - 13", TypeID: "81826"}) || event.StructureReferences[1] != (StructureReference{ID: "1052657361104", Name: "EL8-4Q - 4-1", TypeID: "81826"}) {
+		t.Fatalf("unexpected bulk structure references: %#v", event.StructureReferences)
+	}
 }
 
 func TestClassifyDoesNotAddExcludedNotificationTypes(t *testing.T) {

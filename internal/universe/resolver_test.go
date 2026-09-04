@@ -11,11 +11,13 @@ import (
 )
 
 type resolverDatabase struct {
-	names map[string]string
-	err   error
+	names     map[string]string
+	err       error
+	system    SolarSystem
+	systemErr error
 }
 
-func (d resolverDatabase) ResolveNames(_ context.Context, _ string, ids []string) (map[string]string, error) {
+func (d *resolverDatabase) ResolveNames(_ context.Context, _ string, ids []string) (map[string]string, error) {
 	if d.err != nil {
 		return nil, d.err
 	}
@@ -28,8 +30,8 @@ func (d resolverDatabase) ResolveNames(_ context.Context, _ string, ids []string
 	return result, nil
 }
 
-func (resolverDatabase) ResolveSolarSystem(context.Context, string) (SolarSystem, error) {
-	return SolarSystem{}, nil
+func (d *resolverDatabase) ResolveSolarSystem(context.Context, string) (SolarSystem, error) {
+	return d.system, d.systemErr
 }
 
 type resolverESI struct {
@@ -39,6 +41,8 @@ type resolverESI struct {
 	regionCalls        *int
 	structureType      Entity
 	structureTypeCalls *int
+	systemResponse     *SolarSystem
+	systemErr          error
 }
 
 func (resolverESI) ResolveAlliance(context.Context, string) (Entity, error) {
@@ -63,7 +67,13 @@ func (resolverESI) ResolveCharacter(context.Context, string) (Entity, error) {
 	return Entity{}, errors.New("unexpected character lookup")
 }
 
-func (resolverESI) ResolveSolarSystem(context.Context, string) (SolarSystem, error) {
+func (e *resolverESI) ResolveSolarSystem(context.Context, string) (SolarSystem, error) {
+	if e.systemResponse != nil || e.systemErr != nil {
+		if e.systemResponse == nil {
+			return SolarSystem{}, e.systemErr
+		}
+		return *e.systemResponse, e.systemErr
+	}
 	return SolarSystem{}, errors.New("unexpected system lookup")
 }
 
@@ -82,9 +92,38 @@ func (resolverESI) ResolveMoon(context.Context, string) (Entity, error) {
 	return Entity{}, errors.New("unexpected moon lookup")
 }
 
+func TestResolverRejectsNilContexts(t *testing.T) {
+	resolver := NewResolver(nil, nil)
+	var nilContext context.Context
+	if _, err := resolver.ResolveAlliance(nilContext, "100"); err == nil {
+		t.Fatal("expected nil alliance context to fail")
+	}
+	if _, err := resolver.ResolveCharacter(nilContext, "100"); err == nil {
+		t.Fatal("expected nil character context to fail")
+	}
+	if _, err := resolver.ResolveCorporation(nilContext, "100"); err == nil {
+		t.Fatal("expected nil corporation context to fail")
+	}
+	if _, err := resolver.ResolveRegion(nilContext, "100"); err == nil {
+		t.Fatal("expected nil region context to fail")
+	}
+	if _, err := resolver.ResolveSolarSystem(nilContext, "100"); err == nil {
+		t.Fatal("expected nil solar system context to fail")
+	}
+	if _, err := resolver.ResolveStructureType(nilContext, "100"); err == nil {
+		t.Fatal("expected nil structure type context to fail")
+	}
+	if _, err := resolver.ResolvePlanet(nilContext, "100"); err == nil {
+		t.Fatal("expected nil planet context to fail")
+	}
+	if _, err := resolver.ResolveMoon(nilContext, "100"); err == nil {
+		t.Fatal("expected nil moon context to fail")
+	}
+}
+
 func TestResolveCorporationPrefersDatabaseName(t *testing.T) {
 	resolver := NewResolver(
-		resolverDatabase{names: map[string]string{"100": "Managed Corporation"}},
+		&resolverDatabase{names: map[string]string{"100": "Managed Corporation"}},
 		&resolverESI{corporation: Entity{ID: "100", Name: "ESI Corporation"}},
 	)
 
@@ -99,7 +138,7 @@ func TestResolveCorporationPrefersDatabaseName(t *testing.T) {
 
 func TestResolveCorporationFallsBackToESIOnDatabaseError(t *testing.T) {
 	resolver := NewResolver(
-		resolverDatabase{err: errors.New("database unavailable")},
+		&resolverDatabase{err: errors.New("database unavailable")},
 		&resolverESI{corporation: Entity{ID: "100", Name: "ESI Corporation"}},
 	)
 
@@ -124,6 +163,22 @@ func TestResolveCorporationWorksWithoutDatabase(t *testing.T) {
 	}
 }
 
+func TestResolveSolarSystemPreservesPartialDataOnESIFailure(t *testing.T) {
+	sentinel := errors.New("region service unavailable")
+	resolver := NewResolver(
+		&resolverDatabase{system: SolarSystem{ID: "300", Name: "Local System"}},
+		&resolverESI{systemResponse: &SolarSystem{RegionID: "10000015", RegionName: "Pure Blind"}, systemErr: sentinel},
+	)
+
+	got, err := resolver.ResolveSolarSystem(context.Background(), "300")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("resolve error = %v, want sentinel", err)
+	}
+	if got.Name != "Local System" || got.RegionID != "10000015" || got.RegionName != "Pure Blind" {
+		t.Fatalf("partial solar system = %+v", got)
+	}
+}
+
 func TestResolverCapsIdentityCache(t *testing.T) {
 	resolver := NewResolver(nil, nil).(*resolver)
 	for index := range maxCachedEntities + 1 {
@@ -142,7 +197,7 @@ func TestResolverCapsIdentityCache(t *testing.T) {
 func TestResolveCorporationCachesSuccessfulFallback(t *testing.T) {
 	var calls int
 	resolver := NewResolver(
-		resolverDatabase{},
+		&resolverDatabase{},
 		&resolverESI{
 			corporation:      Entity{ID: "100", Name: "ESI Corporation"},
 			corporationCalls: &calls,
@@ -166,7 +221,7 @@ func TestResolveCorporationCachesSuccessfulFallback(t *testing.T) {
 func TestResolveCorporationLogsCascade(t *testing.T) {
 	var output bytes.Buffer
 	resolver := NewResolverWithLogger(
-		resolverDatabase{},
+		&resolverDatabase{},
 		&resolverESI{corporation: Entity{ID: "100", Name: "ESI Corporation"}},
 		slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	)
@@ -193,7 +248,7 @@ func TestResolveCorporationLogsCascade(t *testing.T) {
 func TestResolveRegionAndStructureTypeCacheESIFallbacks(t *testing.T) {
 	var regionCalls, structureTypeCalls int
 	resolver := NewResolver(
-		resolverDatabase{},
+		&resolverDatabase{},
 		&resolverESI{
 			region:             Entity{ID: "10000015", Name: "Pure Blind"},
 			regionCalls:        &regionCalls,
@@ -230,7 +285,7 @@ func TestResolveRegionAndStructureTypeCacheESIFallbacks(t *testing.T) {
 
 func TestResolveRegionAndStructureTypePreferDatabase(t *testing.T) {
 	resolver := NewResolver(
-		resolverDatabase{names: map[string]string{
+		&resolverDatabase{names: map[string]string{
 			"10000015": "Database Region",
 			"35834":    "Database Structure Type",
 		}},

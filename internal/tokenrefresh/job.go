@@ -13,6 +13,7 @@ import (
 
 	"github.com/btnmasher/rex/jobruntime/jobs"
 	"github.com/btnmasher/rex/jobruntime/jobstore"
+	"github.com/btnmasher/rex/jobruntime/scheduler"
 )
 
 const (
@@ -178,20 +179,13 @@ func (j *Job) Run(ctx context.Context) (string, error) {
 	return runID, err
 }
 
-// RunPeriodically starts another refresh every fifteen minutes until cancellation.
+// RunPeriodically starts refreshes on quarter-hour wall-clock boundaries until cancellation.
 func (j *Job) RunPeriodically(ctx context.Context) error {
 	j.logger.Info("access-token refresh scheduler started", "interval", refreshInterval)
-	ticker := time.NewTicker(refreshInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			j.logger.Info("scheduled access-token refresh starting")
-			j.runAndLog(ctx)
-		}
-	}
+	return scheduler.Run(ctx, refreshInterval, func(ctx context.Context) {
+		j.logger.Info("scheduled access-token refresh starting")
+		j.runAndLog(ctx)
+	})
 }
 
 func (j *Job) runAndLog(ctx context.Context) {

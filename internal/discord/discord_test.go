@@ -20,7 +20,7 @@ func (t failingTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	return nil, fmt.Errorf("transport failed for %s: %w", request.URL, t.err)
 }
 
-func TestWebhookDeliveryDisablesMentions(t *testing.T) {
+func TestWebhookDeliveryPreservesMentionPolicy(t *testing.T) {
 	requests := make(chan map[string]any, 1)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
@@ -49,28 +49,48 @@ func TestWebhookDeliveryDisablesMentions(t *testing.T) {
 	if !ok {
 		t.Fatalf("allowed_mentions = %#v", payload["allowed_mentions"])
 	}
-	if values, ok := mentions["parse"].([]any); !ok || len(values) != 0 {
+	if values, ok := mentions["parse"].([]any); !ok || len(values) != 1 || values[0] != "users" {
 		t.Fatalf("allowed_mentions.parse = %#v", mentions["parse"])
 	}
 }
 
-func TestDeliveryRetryDelayIsCapped(t *testing.T) {
-	if got := deliveryRetryDelay(1, webhookResponse{headers: http.Header{"Retry-After": []string{"999999999"}}}); got != 30*time.Minute {
-		t.Fatalf("retry delay = %s, want 30m", got)
-	}
-	if got := deliveryRetryDelay(1, webhookResponse{headers: http.Header{"Retry-After": []string{"NaN"}}}); got != webhookRetryDelay+webhookRetryBuffer {
-		t.Fatalf("invalid retry delay = %s, want %s", got, webhookRetryDelay+webhookRetryBuffer)
+func TestWebhookDeliveryDefaultsToNoMentions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload Message
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		if payload.AllowedMentions.Parse == nil || len(payload.AllowedMentions.Parse) != 0 {
+			t.Errorf("allowed mentions = %#v", payload.AllowedMentions.Parse)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	delivery := NewWebhookDelivery(server.Client())
+	delivery.validateURL = func(string) error { return nil }
+	if err := delivery.Deliver(context.Background(), Destination{WebhookURL: server.URL}, &Message{Content: "safe"}); err != nil {
+		t.Fatalf("deliver: %v", err)
 	}
 }
 
-func TestWebhookDeliveryRetriesRateLimitAndCompletes(t *testing.T) {
+func TestDeliveryRetryDelayIsCapped(t *testing.T) {
+	if got := retryDelay(webhookResponse{headers: http.Header{"Retry-After": []string{"999999999"}}}); got != 30*time.Minute {
+		t.Fatalf("retry delay = %s, want 30m", got)
+	}
+	if got := retryDelay(webhookResponse{headers: http.Header{"Retry-After": []string{"NaN"}}}); got != defaultRetryDelay {
+		t.Fatalf("invalid retry delay = %s, want %s", got, defaultRetryDelay)
+	}
+}
+
+func TestWebhookDeliveryReturnsRateLimitToDurableRetryQueue(t *testing.T) {
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		attempts++
 		if attempts == 1 {
-			writer.Header().Set("Retry-After", "0.001")
+			writer.Header().Set("Retry-After", "1")
 			writer.WriteHeader(http.StatusTooManyRequests)
-			_, _ = writer.Write([]byte(`{"message":"rate limited","retry_after":0.001}`))
+			_, _ = writer.Write([]byte(`{"message":"rate limited","retry_after":1}`))
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
@@ -79,11 +99,39 @@ func TestWebhookDeliveryRetriesRateLimitAndCompletes(t *testing.T) {
 
 	delivery := NewWebhookDelivery(server.Client())
 	delivery.validateURL = func(string) error { return nil }
-	if err := delivery.Deliver(context.Background(), Destination{WebhookURL: server.URL}, &Message{Embeds: []Embed{{Description: "alert"}}}); err != nil {
-		t.Fatalf("deliver after rate limit: %v", err)
+	err := delivery.Deliver(context.Background(), Destination{WebhookURL: server.URL}, &Message{Embeds: []Embed{{Description: "alert"}}})
+	retryErr, ok := errors.AsType[*RetryableError](err)
+	if !ok {
+		t.Fatalf("delivery error = %v, want RetryableError", err)
 	}
-	if attempts != 2 {
-		t.Fatalf("webhook attempts = %d, want 2", attempts)
+	if retryErr.Delay != time.Second {
+		t.Fatalf("retry delay = %s, want 1s", retryErr.Delay)
+	}
+	if attempts != 1 {
+		t.Fatalf("webhook attempts = %d, want 1", attempts)
+	}
+	cooldownErr := delivery.Deliver(context.Background(), Destination{WebhookURL: server.URL}, &Message{Embeds: []Embed{{Description: "alert"}}})
+	if _, ok := errors.AsType[*RetryableError](cooldownErr); !ok {
+		t.Fatalf("cooldown error = %v, want RetryableError", cooldownErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("webhook attempts during cooldown = %d, want 1", attempts)
+	}
+}
+
+func TestWebhookDeliveryNilAndZeroValueAreSafe(t *testing.T) {
+	var nilDelivery *WebhookDelivery
+	if err := nilDelivery.Deliver(context.Background(), Destination{}, &Message{Embeds: []Embed{{Description: "alert"}}}); err == nil {
+		t.Fatal("nil delivery unexpectedly succeeded")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	zeroDelivery := &WebhookDelivery{validateURL: func(string) error { return nil }}
+	if err := zeroDelivery.Deliver(context.Background(), Destination{WebhookURL: server.URL}, &Message{Embeds: []Embed{{Description: "alert"}}}); err != nil {
+		t.Fatalf("zero-value delivery: %v", err)
 	}
 }
 
@@ -91,6 +139,21 @@ func TestDeliveryRetryDelayUsesJSONRetryAfter(t *testing.T) {
 	response := webhookResponse{body: []byte(`{"retry_after":1.25}`)}
 	if got := retryAfterResponse(response); got != 1250*time.Millisecond {
 		t.Fatalf("JSON retry delay = %s, want 1.25s", got)
+	}
+}
+
+func TestWebhookCooldownsTrackRemoteBackoffWithoutBlocking(t *testing.T) {
+	cooldowns := newWebhookCooldowns()
+	if got := cooldowns.remaining("webhook"); got != 0 {
+		t.Fatalf("initial cooldown = %s, want zero", got)
+	}
+
+	cooldowns.set("webhook", time.Second)
+	if got := cooldowns.remaining("webhook"); got <= 0 {
+		t.Fatalf("tracked cooldown = %s, want positive duration", got)
+	}
+	if got := cooldowns.remaining("other-webhook"); got != 0 {
+		t.Fatalf("unrelated cooldown = %s, want zero", got)
 	}
 }
 
@@ -117,6 +180,9 @@ func TestWebhookDeliveryRedactsWebhookURLFromTransportErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected transport error")
 	}
+	if _, ok := errors.AsType[*RetryableError](err); !ok {
+		t.Fatalf("error = %v, want RetryableError", err)
+	}
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, want wrapped transport error", err)
 	}
@@ -135,7 +201,6 @@ func TestWebhookDeliveryDoesNotPersistResponseBodyInErrors(t *testing.T) {
 
 	delivery := NewWebhookDelivery(server.Client())
 	delivery.validateURL = func(string) error { return nil }
-	delivery.maxTry = 1
 	err := delivery.Deliver(context.Background(), Destination{WebhookURL: server.URL + "/api/webhooks/123/" + secret}, &Message{
 		Embeds: []Embed{{Description: "alert"}},
 	})

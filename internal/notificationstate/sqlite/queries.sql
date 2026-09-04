@@ -23,6 +23,8 @@ insert into notification_retries (
   corporation_ticker,
   character_id,
   notification_json,
+  destination_ids_json,
+  delivered_destination_ids_json,
   failed_destination_ids_json,
   attempts,
   created_at,
@@ -30,12 +32,13 @@ insert into notification_retries (
   last_error,
   updated_at
 )
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
 on conflict(notification_id) do nothing;
 
 -- name: ListPending :many
 select notification_id, corporation_id, corporation_name, corporation_ticker,
-       character_id, notification_json, failed_destination_ids_json, attempts,
+       character_id, notification_json, destination_ids_json,
+       delivered_destination_ids_json, failed_destination_ids_json, attempts,
        created_at, next_retry_at, last_error
 from notification_retries
 where next_retry_at <= ?
@@ -44,7 +47,7 @@ limit ?;
 
 -- name: ReschedulePending :execrows
 update notification_retries
-set failed_destination_ids_json = ?, attempts = ?, next_retry_at = ?,
+set delivered_destination_ids_json = ?, failed_destination_ids_json = ?, attempts = ?, next_retry_at = ?,
     last_error = ?, updated_at = unixepoch()
 where notification_id = ?;
 
@@ -69,17 +72,19 @@ insert into alert_history (
   corporation_ticker,
   character_id,
   destination_id,
+  delivery_status,
+  delivery_error,
   dispatched_at,
   raw_notification_json,
   classified_event_json,
   discord_payload_json
 )
-values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: ListAlertHistory :many
 select id, notification_id, notification_type, alert_type,
        corporation_id, corporation_name, corporation_ticker, character_id,
-       destination_id, dispatched_at, raw_notification_json,
+       destination_id, delivery_status, delivery_error, dispatched_at, raw_notification_json,
        classified_event_json, discord_payload_json
 from alert_history
 where dispatched_at >= ?
