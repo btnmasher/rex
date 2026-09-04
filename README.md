@@ -246,15 +246,19 @@ Use process supervision and structured logs for operational monitoring.
 The image does not run migrations during build. On startup, Rex migrates the
 selected durable stores before starting workers. The image runs as a non-root
 user; Compose additionally makes the root filesystem read-only and persists
-SQLite state in the `rex-state` volume.
-The destination file mount uses Docker's private SELinux relabel option (`Z`),
-which is required on Fedora for the confined container to read a host file.
+SQLite state in the Docker-managed `rex-state` volume.
+The destination file mount uses Docker's private SELinux relabel option (`Z`)
+for hosts that require it.
+
+`task docker:logs` follows the container stream, colorizes the Compose prefix
+and JSON syntax for the terminal, and appends a raw local copy to
+`.logs/rex.log`. It follows only new entries rather than replaying retained
+container history, and requires `jq` on the host.
 
 For local Compose use:
 
 ```bash
-task docker:build
-task docker:up:detach
+task docker:build:up:detach
 ```
 
 For a published image, set the image tag and restart the container. The same

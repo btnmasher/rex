@@ -17,10 +17,6 @@ coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-/uploader/
-
 # Go workspace file
 go.work
 go.work.sum
@@ -52,7 +48,10 @@ bin/
 # local dev artifacts
 pb_data/
 /logs/
-dev-logs/
+.logs/
+.data/
+*.local.yml
+docker-compose.override.yml
 
 # Editor/IDE
 .idea/

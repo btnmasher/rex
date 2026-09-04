@@ -339,11 +339,22 @@ under `gen/`.
 The Dockerfile builds a CGO-free static service image as a non-root user.
 Migration files are embedded in the binary and are not executed during image
 build. A new image applies pending migrations at startup before workers begin.
-The Compose configuration mounts `/data` for both SQLite stores, makes the
-container root filesystem read-only, and grants write access only to that
-volume. The destination configuration bind mount uses Docker's private SELinux
-relabel option for Fedora hosts. The image accepts `VERSION`, `REVISION`, and
-`CREATED` build arguments for OCI metadata.
+The base Compose configuration uses the Docker-managed `rex-state` volume at
+`/data` for both SQLite stores, makes the container root filesystem read-only,
+and grants write access only to that volume. A machine-local
+`docker-compose.override.yml` may replace that volume with a `.data/` bind
+mount for development; that host directory must be provisioned with write
+access for the image user (UID `65532`). Production deployments should use the
+base Compose file or provision a persistent host mount with that ownership
+themselves.
+
+The destination configuration bind mount uses Docker's private SELinux relabel
+option for hosts that require it. The image accepts `VERSION`, `REVISION`, and
+`CREATED` build arguments for OCI metadata. `task docker:logs` follows the container
+stdout/stderr stream, colorizes the Compose prefix and JSON syntax for the
+terminal, and appends a raw copy to `.logs/rex.log`; it follows only new log
+entries rather than replaying retained container history. Rex itself continues
+to emit logs to stdout/stderr. The task requires `jq` on the host.
 
 The CI workflow runs `task ci:checks` and a cached Buildx build for pull
 requests and pushes to `main`. The release workflow accepts Go-style `vX.Y.Z`
@@ -357,6 +368,7 @@ the only workflow with `packages: write` permission.
 - Keep `.env` and the configured JSON/YAML destination file untracked.
 - Never log auth-next bearer credentials, access tokens, or webhook URLs.
 - Keep payload logging disabled unless actively troubleshooting.
-- Keep SQLite state on persistent storage in deployments.
+- Keep the production Compose `rex-state` volume or equivalent persistent mount
+  on durable storage.
 - Validate new external URLs and bound response, payload, and history sizes.
 - Preserve secret redaction when adding structured log attributes or durable fields.

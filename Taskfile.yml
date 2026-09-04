@@ -9,6 +9,7 @@ vars:
   IMAGE: 'rex-notification-service:local'
   SQLC_VERSION: 'v1.31.1'
   GOLANGCI_VERSION: 'v2.13.0'
+  COMPOSE: 'docker compose'
 
 tasks:
   default:
@@ -204,37 +205,37 @@ tasks:
   docker:up:
     desc: Start the service in the foreground.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml up
+      - '{{.COMPOSE}} up'
 
   docker:up:detach:
     desc: Start the service in the background.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml up -d
+      - '{{.COMPOSE}} up -d'
 
   docker:build:up:
     desc: Build the service image and start Compose in the foreground.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml up --build
+      - '{{.COMPOSE}} up --build'
 
   docker:build:up:detach:
     desc: Build the service image and start Compose in the background.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml up -d --build
+      - '{{.COMPOSE}} up -d --build'
 
   docker:logs:
-    desc: Follow service logs.
+    desc: Follow service logs and append them to .logs/rex.log.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml logs -f
+      - '{{.ROOT}}/scripts/docker-logs.sh {{.ROOT}}'
 
   docker:status:
     desc: Show service status.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml ps
+      - '{{.COMPOSE}} ps'
 
   docker:down:
     desc: Stop the standalone service.
     cmds:
-      - docker compose -f {{.ROOT}}/docker-compose.yml down
+      - '{{.COMPOSE}} down'
 
   docker:restart:
     desc: Restart the standalone service.

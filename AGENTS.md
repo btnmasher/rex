@@ -332,6 +332,10 @@ When the user requests a durable behavior change, record it here or in the relev
   only when `JOB_STORE=postgres`; explicit migration commands select their
   backend by `--store` and require the matching database configuration.
   Auth-next tables remain externally owned and are never migrated by Rex.
+  Production Compose persists SQLite state through the Docker-managed
+  `rex-state` volume; a machine-local Compose override can replace it with the
+  host `.data/` bind mount for development, with host permissions managed
+  locally.
 - `task ci:checks` is the canonical pre-merge gate: it runs verification,
   race tests, and rejects generated or formatted drift. Release tags publish
   the non-root multi-architecture Docker image to GHCR after those same gates
