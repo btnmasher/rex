@@ -115,10 +115,12 @@ presentation with a provider-specific `delivery` object:
 - Alert selectors are case-insensitive; groups may use either `group` or `group.*`.
 
 The static embed colors are defined by alert meaning and are not configurable:
-red for danger and attack events, no-reagent alerts, and ESS main-bank links;
-green for gained sovereignty, online, and full-power transitions; blue for
-anchoring and informational ownership changes; and yellow for warnings such as
-unanchoring, reinforcement changes, vulnerability, fuel, and offline states.
+red for danger and attack events, no-reagent alerts, ESS main-bank links, and
+canceled moon-mining extractions; green for gained sovereignty, online,
+full-power, laser-fired, and automatic-fracture transitions; blue for anchoring,
+moon-mining extraction started, and informational ownership changes; and yellow
+for warnings such as unanchoring, reinforcement changes, vulnerability, fuel,
+and offline states.
 
 ### Supported Alert Selectors
 

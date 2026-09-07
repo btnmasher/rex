@@ -177,6 +177,77 @@ type Config struct {
 	History      notificationstate.AlertHistory
 }
 
+// alertColors assigns a color to every canonical alert leaf and supported group.
+// Unknown selectors intentionally default to danger.
+var alertColors = map[string]int{
+	// Structures.
+	notifications.AlertStructureUnderAttack:           colorDanger,
+	notifications.AlertStructureDestroyed:             colorDanger,
+	notifications.AlertStructureAnchoring:             colorInformational,
+	notifications.AlertStructureUnanchoring:           colorWarning,
+	notifications.AlertStructureReinforced:            colorDanger,
+	notifications.AlertStructureOnline:                colorSuccess,
+	notifications.AlertStructureWentLowPower:          colorWarning,
+	notifications.AlertStructureWentHighPower:         colorSuccess,
+	notifications.AlertStructuresReinforcementChanged: colorWarning,
+	notifications.AlertStructureVulnerable:            colorWarning,
+	notifications.AlertStructureOffline:               colorWarning,
+	notifications.AlertStructureOwnership:             colorInformational,
+	notifications.AlertStructureFuelAlert:             colorWarning,
+	notifications.AlertStructureLowReagents:           colorWarning,
+	notifications.AlertStructureNoReagents:            colorDanger,
+	notifications.AlertStructureLostShields:           colorDanger,
+	notifications.AlertStructureLostArmor:             colorDanger,
+	notifications.AlertStructureImpendingAbandonment:  colorDanger,
+
+	// Sovereignty and ESS.
+	notifications.AlertEntosisCaptureStarted:             colorDanger,
+	notifications.AlertEntosisCaptureFinished:            colorDanger,
+	notifications.AlertEntosisCaptureNodesReinforced:     colorDanger,
+	notifications.AlertSovCommandNodeEventStarted:        colorDanger,
+	notifications.AlertSovStationEnteredReinforce:        colorDanger,
+	notifications.AlertSovStationExitedReinforce:         colorWarning,
+	notifications.AlertSovStructureReinforced:            colorDanger,
+	notifications.AlertSovStructureDestroyed:             colorDanger,
+	notifications.AlertSovAllClaimAcquiredMsg:            colorSuccess,
+	notifications.AlertSovAllClaimLostMsg:                colorDanger,
+	notifications.AlertSovStructureSelfDestructRequested: colorDanger,
+	notifications.AlertSovStructureSelfDestructCancel:    colorWarning,
+	notifications.AlertSovStructureSelfDestructFinished:  colorDanger,
+	notifications.AlertSovereigntyClaimed:                colorSuccess,
+	notifications.AlertSovereigntyLost:                   colorDanger,
+	notifications.AlertESSMainBankLink:                   colorDanger,
+	notifications.AlertESSReserveBankLink:                colorWarning,
+
+	// Skyhooks, mercenary dens, and moon mining.
+	notifications.AlertSkyhookUnderAttack:            colorDanger,
+	notifications.AlertSkyhookLostShields:            colorDanger,
+	notifications.AlertSkyhookDestroyed:              colorDanger,
+	notifications.AlertSkyhookOnline:                 colorInformational,
+	notifications.AlertSkyhookDeployed:               colorInformational,
+	notifications.AlertMercenaryDenReinforced:        colorDanger,
+	notifications.AlertMercenaryDenAttacked:          colorDanger,
+	notifications.AlertMercenaryDenNewMTO:            colorWarning,
+	notifications.AlertMoonminingExtractionStarted:   colorInformational,
+	notifications.AlertMoonminingExtractionCancelled: colorDanger,
+	notifications.AlertMoonminingExtractionFinished:  colorDanger,
+	notifications.AlertMoonminingLaserFired:          colorSuccess,
+	notifications.AlertMoonminingAutomaticFracture:   colorSuccess,
+
+	// Station services, starbases, and customs offices.
+	notifications.AlertStationServiceEnabled:   colorInformational,
+	notifications.AlertStationServiceDisabled:  colorWarning,
+	notifications.AlertStarbaseUnderAttack:     colorDanger,
+	notifications.AlertStarbaseResourceAlert:   colorWarning,
+	notifications.AlertCustomsOfficeAttacked:   colorDanger,
+	notifications.AlertCustomsOfficeReinforced: colorDanger,
+
+	// Preserve warning behavior when a group selector is used directly.
+	notifications.AlertESS:           colorWarning,
+	notifications.AlertStructureFuel: colorWarning,
+	notifications.AlertStarbase:      colorWarning,
+}
+
 // DeliveryRequest identifies one event and optionally limits delivery to the
 // destinations that failed in a previous attempt.
 type DeliveryRequest struct {
@@ -1294,30 +1365,10 @@ func alertColor(event *notifications.Event) int {
 	if event == nil {
 		return colorDanger
 	}
-	switch {
-	case isGainingSovereignty(event.NotificationType), event.AlertType == notifications.AlertStructureOnline, event.NotificationType == "StructureOnline", event.AlertType == notifications.AlertStructureWentHighPower, event.NotificationType == "StructureWentHighPower":
-		return colorSuccess
-	case event.NotificationType == "StructureAnchoring", event.AlertType == notifications.AlertStructureAnchoring, event.NotificationType == "SkyhookOnline", event.NotificationType == "SkyhookDeployed", event.NotificationType == "StationServiceEnabled":
-		return colorInformational
-	case event.NotificationType == "OwnershipTransferred":
-		return colorInformational
-	case event.NotificationType == "StructureUnderAttack", event.NotificationType == "SkyhookUnderAttack", event.NotificationType == "MercenaryDenAttacked", event.NotificationType == "StructureLostShields", event.NotificationType == "StructureLostArmor", event.NotificationType == "SovStructureSelfDestructRequested", event.NotificationType == "OrbitalAttacked", event.NotificationType == "OrbitalReinforced":
-		return colorDanger
-	case event.AlertType == notifications.AlertESSMainBankLink, event.NotificationType == "ESSMainBankLink", event.AlertType == notifications.AlertStructureNoReagents, event.NotificationType == "StructureNoReagentsAlert":
-		return colorDanger
-	case event.NotificationType == "TowerAlertMsg":
-		return colorDanger
-	case notifications.AlertTypeInGroup(event.AlertType, notifications.AlertESS):
-		return colorWarning
-	case event.AlertType == notifications.AlertStructureUnanchoring, event.NotificationType == "StructureUnanchoring", event.AlertType == notifications.AlertSovStationExitedReinforce, event.NotificationType == "SovStationExitedReinforce", event.AlertType == notifications.AlertStructuresReinforcementChanged, event.NotificationType == "StructuresReinforcementChanged", event.AlertType == notifications.AlertStructureVulnerable, event.NotificationType == "StructureVulnerable", event.AlertType == notifications.AlertSovStructureSelfDestructCancel, event.NotificationType == "SovStructureSelfDestructCancel", notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStructureFuel), notifications.AlertTypeInGroup(event.AlertType, notifications.AlertStarbase), event.NotificationType == "StructureServicesOffline", event.NotificationType == "StructureWentLowPower", event.NotificationType == "StationServiceDisabled", event.NotificationType == "MercenaryDenNewMTO":
-		return colorWarning
-	default:
-		return colorDanger
+	if color, ok := alertColors[event.AlertType]; ok {
+		return color
 	}
-}
-
-func isGainingSovereignty(notificationType string) bool {
-	return notificationType == "SovAllClaimAquiredMsg" || notificationType == "SovereigntyClaimed"
+	return colorDanger
 }
 
 func optionalString(value *string) string {

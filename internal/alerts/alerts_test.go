@@ -1039,6 +1039,26 @@ func TestAlertColorDefaults(t *testing.T) {
 			event:         notifications.Event{AlertType: notifications.AlertSovStructureSelfDestructCancel, NotificationType: "SovStructureSelfDestructCancel"},
 			expectedColor: colorWarning,
 		},
+		{
+			name:          "moon mining extraction started",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingExtractionStarted, NotificationType: "MoonminingExtractionStarted"},
+			expectedColor: colorInformational,
+		},
+		{
+			name:          "moon mining extraction canceled",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingExtractionCancelled, NotificationType: "MoonminingExtractionCancelled"},
+			expectedColor: colorDanger,
+		},
+		{
+			name:          "moon mining laser fired",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingLaserFired, NotificationType: "MoonminingLaserFired"},
+			expectedColor: colorSuccess,
+		},
+		{
+			name:          "moon mining automatic fracture",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingAutomaticFracture, NotificationType: "MoonminingAutomaticFracture"},
+			expectedColor: colorSuccess,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1046,6 +1066,14 @@ func TestAlertColorDefaults(t *testing.T) {
 				t.Fatalf("alertColor() = %#x, want %#x", got, test.expectedColor)
 			}
 		})
+	}
+}
+
+func TestAlertColorsCoverEveryAlertLeaf(t *testing.T) {
+	for _, alertType := range notifications.AllAlertTypes() {
+		if _, ok := alertColors[alertType]; !ok {
+			t.Errorf("alert color is not defined for %q", alertType)
+		}
 	}
 }
 
