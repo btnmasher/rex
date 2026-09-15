@@ -55,6 +55,7 @@ type Context struct {
 	Structures               []authnextdb.Structure
 	StructureTypeName        string
 	StructureTypeNames       map[string]string
+	OreTypeNames             map[string]string
 	CharacterID              string
 	RawNotificationJSON      []byte
 	PollingCorporationID     string
@@ -96,6 +97,7 @@ func (s *Service) Enrich(ctx context.Context, envelope *Envelope) (*Context, err
 	event.StructureTypeID = structureTypeIDForEvent(&event, structures)
 	structureTypeName := s.resolveStructureTypeName(ctx, event.StructureTypeID, structures)
 	structureTypeNames := s.resolveEventStructureTypeNames(ctx, &event, structures)
+	oreTypeNames := s.resolveOreTypeNames(ctx, event.OreComposition)
 	location := s.resolveLocation(ctx, event.SystemID)
 
 	if event.AllianceID == "" && location.AllianceID != "" {
@@ -132,6 +134,7 @@ func (s *Service) Enrich(ctx context.Context, envelope *Envelope) (*Context, err
 		PollingCorporationTicker: envelope.Corporation.Ticker,
 		StructureTypeName:        structureTypeName,
 		StructureTypeNames:       structureTypeNames,
+		OreTypeNames:             oreTypeNames,
 	}
 	if event.OwnerCorporationID != "" {
 		view.CorporationID = event.OwnerCorporationID
@@ -236,6 +239,20 @@ func (s *Service) resolveEventStructureTypeNames(ctx context.Context, event *not
 			continue
 		}
 		if _, ok := names[typeID]; ok {
+			continue
+		}
+		if name := s.resolveStructureTypeName(ctx, typeID, nil); name != "" {
+			names[typeID] = name
+		}
+	}
+	return names
+}
+
+func (s *Service) resolveOreTypeNames(ctx context.Context, composition []notifications.OreComposition) map[string]string {
+	names := make(map[string]string, len(composition))
+	for _, ore := range composition {
+		typeID := strings.TrimSpace(ore.TypeID)
+		if typeID == "" {
 			continue
 		}
 		if name := s.resolveStructureTypeName(ctx, typeID, nil); name != "" {

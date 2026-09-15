@@ -99,6 +99,19 @@ func TestEnrichUsesPayloadOwnerAndGlobalStructureLookup(t *testing.T) {
 	}
 }
 
+func TestEnrichResolvesMoonminingOreNames(t *testing.T) {
+	view, err := NewService(nil, enrichmentResolver{}, nil).Enrich(context.Background(), &Envelope{
+		Corporation: authnextdb.Corporation{ID: "100", Name: "Polling Corp"},
+		Event:       notifications.Event{OreComposition: []notifications.OreComposition{{TypeID: "45498", Volume: 10}}},
+	})
+	if err != nil {
+		t.Fatalf("enrich: %v", err)
+	}
+	if view.OreTypeNames["45498"] != "Athanor" {
+		t.Fatalf("ore type names = %#v", view.OreTypeNames)
+	}
+}
+
 func TestEnrichRemainsUsableWithoutOptionalSources(t *testing.T) {
 	service := NewService(nil, nil, nil)
 	view, err := service.Enrich(context.Background(), &Envelope{

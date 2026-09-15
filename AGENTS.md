@@ -342,8 +342,10 @@ When the user requests a durable behavior change, record it here or in the relev
   pass.
 - `internal/alerts` may run without a structure database; missing enrichment is
   non-fatal, and ownership-transfer alerts use the informational blue default.
-  Full-power structure transitions use the success green default. Both
-  `internal/alerts` and `internal/discord` must keep rendered
+  Full-power structure transitions, moon-mining laser-fired events, and
+  automatic-fracture events use the success green default. Moon-mining
+  extraction-started events use informational blue, while canceled extractions
+  use danger red. Both `internal/alerts` and `internal/discord` must keep rendered
   embeds within Discord's published limits and escape upstream or hydrated
   display text before placing it in Markdown-capable fields.
 - Bulk `StructuresReinforcementChanged` payloads may identify multiple

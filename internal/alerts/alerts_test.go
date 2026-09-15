@@ -1039,6 +1039,26 @@ func TestAlertColorDefaults(t *testing.T) {
 			event:         notifications.Event{AlertType: notifications.AlertSovStructureSelfDestructCancel, NotificationType: "SovStructureSelfDestructCancel"},
 			expectedColor: colorWarning,
 		},
+		{
+			name:          "moon mining extraction started",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingExtractionStarted, NotificationType: "MoonminingExtractionStarted"},
+			expectedColor: colorInformational,
+		},
+		{
+			name:          "moon mining extraction canceled",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingExtractionCancelled, NotificationType: "MoonminingExtractionCancelled"},
+			expectedColor: colorDanger,
+		},
+		{
+			name:          "moon mining laser fired",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingLaserFired, NotificationType: "MoonminingLaserFired"},
+			expectedColor: colorSuccess,
+		},
+		{
+			name:          "moon mining automatic fracture",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingAutomaticFracture, NotificationType: "MoonminingAutomaticFracture"},
+			expectedColor: colorSuccess,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1046,6 +1066,14 @@ func TestAlertColorDefaults(t *testing.T) {
 				t.Fatalf("alertColor() = %#x, want %#x", got, test.expectedColor)
 			}
 		})
+	}
+}
+
+func TestAlertColorsCoverEveryAlertLeaf(t *testing.T) {
+	for _, alertType := range notifications.AllAlertTypes() {
+		if _, ok := alertColors[alertType]; !ok {
+			t.Errorf("alert color is not defined for %q", alertType)
+		}
 	}
 }
 
@@ -1258,6 +1286,29 @@ func TestRenderExpandedNotificationFields(t *testing.T) {
 	}
 	if !hasField(embed.Fields, "Ready At", timestampValue(timestamp.Add(time.Hour))) || !hasField(embed.Fields, "Automatic Fracture At", timestampValue(timestamp.Add(2*time.Hour))) {
 		t.Fatalf("expected moon mining activity fields: %#v", embed.Fields)
+	}
+}
+
+func TestRenderMoonminingOreCompositionAndHarvestingCopy(t *testing.T) {
+	message := render(&eventView{
+		SystemName:   "Jita",
+		OreTypeNames: map[string]string{"45498": "Veldspar", "45500": "Scordite"},
+		Event: notifications.Event{
+			NotificationType: "MoonminingAutomaticFracture",
+			AlertType:        notifications.AlertMoonminingAutomaticFracture,
+			SystemID:         "30000142",
+			OreComposition: []notifications.OreComposition{
+				{TypeID: "45498", Volume: 75},
+				{TypeID: "45500", Volume: 25},
+			},
+		},
+	}, "Rex Alerts", "")
+	embed := message.Embeds[0]
+	if !strings.Contains(embed.Description, "ready for harvesting") {
+		t.Fatalf("unexpected fracture description: %q", embed.Description)
+	}
+	if !hasField(embed.Fields, "Ore Composition", "• Veldspar: **75.0%**\n• Scordite: **25.0%**") {
+		t.Fatalf("unexpected ore composition field: %#v", embed.Fields)
 	}
 }
 
