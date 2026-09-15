@@ -106,6 +106,7 @@ var (
 	selectorSegmentPattern        = regexp.MustCompile(`^[a-z0-9_]+$`)
 	metadataKeyPattern            = regexp.MustCompile(`(?i)(?:aggressorAllianceID|aggressorAllianceName|aggressorCharacterID|aggressorCorpID|aggressorCorporationName|aggressorID|allStructureInfo|allianceID|allianceName|armorPercentage|armorValue|assetSafetyDurationFull|assetSafetyDurationMinimum|assetSafetyFullTimestamp|assetSafetyMinimumTimestamp|autoTime|campaignEventType|cancelledBy|charID|charName|characterID|characterName|corpID|corpLinkData|corpName|daysUntilAbandon|decloakTime|destructTime|firedBy|hullPercentage|hullValue|hour|isActive|isCorpOwned|itemID|listOfServiceModuleIDs|listOfTypesAndQty|mercenaryDenShowInfoData|moonID|moonLink|newOwnerCorpID|newOwnerCorpName|newStationID|numStructures|oldOwnerCorpID|oldOwnerCorpName|oreVolumeByType|ownerCorpLinkData|ownerCorpName|planetID|planetTypeID|readyTime|reinforceExitTime|shieldLevel|shieldPercentage|shieldValue|solarSystemID|solarSystemLink|solarsystemID|startedBy|startedByLink|structureID|structureLink|structureName|structureShowInfoData|structureTypeID|structuresReinforcementChanged|timeLeft|timestamp|timestampEntered|timestampExited|typeID|vulnerableTime|weekday|wants)\s*:`)
 	resourceRequirementPattern    = regexp.MustCompile(`(?i)quantity\s*:\s*(\d+)\s+typeID\s*:\s*(\d+)`)
+	oreCompositionPattern         = regexp.MustCompile(`(?:^|\s)(\d+)\s*:\s*([0-9]+(?:\.[0-9]+)?)`)
 	tagPattern                    = regexp.MustCompile(`<[^>]+>`)
 	spacePattern                  = regexp.MustCompile(`\s+`)
 )
@@ -173,6 +174,12 @@ type ResourceRequirement struct {
 	TypeID   string `json:"type_id"`
 }
 
+// OreComposition identifies the volume of one ore type in a moon-mining extraction.
+type OreComposition struct {
+	TypeID string  `json:"type_id"`
+	Volume float64 `json:"volume"`
+}
+
 // StructureReference identifies a structure reported by a bulk notification.
 type StructureReference struct {
 	ID     string `json:"id"`
@@ -229,6 +236,7 @@ type Event struct {
 	ArmorValue               *float64              `json:"armor_value"`
 	HullValue                *float64              `json:"hull_value"`
 	ResourceRequirements     []ResourceRequirement `json:"resource_requirements"`
+	OreComposition           []OreComposition      `json:"ore_composition"`
 	IsActive                 *bool                 `json:"is_active"`
 	Summary                  string                `json:"summary"`
 	Text                     string                `json:"text"`
@@ -525,6 +533,7 @@ func Classify(notification *esi.Notification) (Event, bool) {
 		ArmorValue:               parseFloatPointer(metadata["armorvalue"]),
 		HullValue:                parseFloatPointer(metadata["hullvalue"]),
 		ResourceRequirements:     parseResourceRequirements(notification.Type, text),
+		OreComposition:           parseOreComposition(notification.Type, metadata["orevolumebytype"]),
 		IsActive:                 parseBoolPointer(metadata["isactive"]),
 		Summary:                  stripMetadata(text),
 		Text:                     text,
@@ -645,6 +654,27 @@ func parseResourceRequirements(notificationType, text string) []ResourceRequirem
 		requirements = append(requirements, ResourceRequirement{Quantity: quantity, TypeID: match[2]})
 	}
 	return requirements
+}
+
+func parseOreComposition(notificationType, value string) []OreComposition {
+	switch notificationType {
+	case "MoonminingExtractionFinished", "MoonminingLaserFired", "MoonminingAutomaticFracture":
+	default:
+		return nil
+	}
+	matches := oreCompositionPattern.FindAllStringSubmatch(value, maxResourceRequirements)
+	composition := make([]OreComposition, 0, len(matches))
+	for _, match := range matches {
+		volume, err := strconv.ParseFloat(match[2], 64)
+		if err != nil || volume <= 0 || math.IsNaN(volume) || math.IsInf(volume, 0) {
+			continue
+		}
+		composition = append(composition, OreComposition{TypeID: match[1], Volume: volume})
+	}
+	sort.Slice(composition, func(left, right int) bool {
+		return composition[left].TypeID < composition[right].TypeID
+	})
+	return composition
 }
 
 func actorMetadata(notificationType string, metadata map[string]string) (characterID, characterName string) {

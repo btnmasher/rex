@@ -219,6 +219,12 @@ enriched with system, region, planet, moon, and type data. The ESI payload's
 owner corporation is authoritative; polling-corporation context is only a
 fallback when owner data is absent.
 
+Moon-mining extraction-finished, manual laser-fired, and automatic-fracture
+notifications may include `oreVolumeByType`. Classification preserves the
+bounded ore volumes, enrichment resolves their type names, and Discord renders
+the resulting percentages as a compact list. Fracture descriptions state that
+the extraction is ready for harvesting.
+
 ## Persistence And Migrations
 
 Notification state and generic job state are separate:

@@ -1289,6 +1289,29 @@ func TestRenderExpandedNotificationFields(t *testing.T) {
 	}
 }
 
+func TestRenderMoonminingOreCompositionAndHarvestingCopy(t *testing.T) {
+	message := render(&eventView{
+		SystemName:   "Jita",
+		OreTypeNames: map[string]string{"45498": "Veldspar", "45500": "Scordite"},
+		Event: notifications.Event{
+			NotificationType: "MoonminingAutomaticFracture",
+			AlertType:        notifications.AlertMoonminingAutomaticFracture,
+			SystemID:         "30000142",
+			OreComposition: []notifications.OreComposition{
+				{TypeID: "45498", Volume: 75},
+				{TypeID: "45500", Volume: 25},
+			},
+		},
+	}, "Rex Alerts", "")
+	embed := message.Embeds[0]
+	if !strings.Contains(embed.Description, "ready for harvesting") {
+		t.Fatalf("unexpected fracture description: %q", embed.Description)
+	}
+	if !hasField(embed.Fields, "Ore Composition", "• Veldspar: **75.0%**\n• Scordite: **25.0%**") {
+		t.Fatalf("unexpected ore composition field: %#v", embed.Fields)
+	}
+}
+
 func TestDeliverIncludesOwnershipTransferDetails(t *testing.T) {
 	delivery := &alertTestDelivery{}
 	service, err := NewService(alertTestDatabase{}, delivery, &Config{

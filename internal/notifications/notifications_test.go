@@ -328,6 +328,28 @@ func TestClassifyTowerResourceAlert(t *testing.T) {
 	}
 }
 
+func TestClassifyMoonminingOreComposition(t *testing.T) {
+	event, ok := Classify(&esi.Notification{
+		ID:   2453669975,
+		Type: "MoonminingAutomaticFracture",
+		Text: "moonID: 40129944\n" +
+			"oreVolumeByType:\n" +
+			"  45511: 1019774.0017277489\n" +
+			"  45498: 1402713.754511558\n" +
+			"solarSystemID: 30002036\n",
+	})
+	if !ok {
+		t.Fatal("expected moon-mining fracture to classify")
+	}
+	want := []OreComposition{
+		{TypeID: "45498", Volume: 1402713.754511558},
+		{TypeID: "45511", Volume: 1019774.0017277489},
+	}
+	if len(event.OreComposition) != len(want) || event.OreComposition[0] != want[0] || event.OreComposition[1] != want[1] {
+		t.Fatalf("unexpected ore composition: %#v", event.OreComposition)
+	}
+}
+
 func TestClassifyCustomsOfficeAttacked(t *testing.T) {
 	event, ok := Classify(&esi.Notification{
 		ID:   1,

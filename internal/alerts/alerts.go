@@ -83,8 +83,8 @@ var eventDescriptionTemplates = map[string]string{
 	"MoonminingExtractionStarted":               "A moon mining extraction has started in %s.",
 	"MoonminingExtractionCancelled":             "A moon mining extraction was canceled in %s.",
 	"MoonminingExtractionFinished":              "A moon mining extraction has finished in %s.",
-	"MoonminingLaserFired":                      "A moon mining laser fired in %s.",
-	"MoonminingAutomaticFracture":               "A moon mining extraction fractured automatically in %s.",
+	"MoonminingLaserFired":                      "A moon mining laser fired, and the extraction is ready for harvesting in %s.",
+	"MoonminingAutomaticFracture":               "A moon mining extraction fractured automatically and is ready for harvesting in %s.",
 	"OwnershipTransferred":                      "Structure ownership has transferred in %s.",
 	"SovStationEnteredReinforce":                "A Sovereignty Hub has entered reinforced mode in %s.",
 	"SovStationExitedReinforce":                 "A Sovereignty Hub has exited reinforced mode in %s.",
@@ -119,6 +119,7 @@ var eventFieldRenderers = [...]func(*eventView) []discord.Field{
 	structureTypeFields,
 	integrityFields,
 	resourceFields,
+	oreCompositionFields,
 	timerFields,
 	activityFields,
 	decloakFields,
@@ -1311,6 +1312,36 @@ func resourceFields(view *eventView) []discord.Field {
 		return nil
 	}
 	return []discord.Field{{Name: "Resources Needed", Value: strings.Join(lines, "\n"), Inline: false}}
+}
+
+func oreCompositionFields(view *eventView) []discord.Field {
+	if view == nil || len(view.Event.OreComposition) == 0 {
+		return nil
+	}
+	totalVolume := 0.0
+	for _, ore := range view.Event.OreComposition {
+		if ore.Volume > 0 {
+			totalVolume += ore.Volume
+		}
+	}
+	if totalVolume <= 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(view.Event.OreComposition))
+	for _, ore := range view.Event.OreComposition {
+		if ore.Volume <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(view.OreTypeNames[ore.TypeID])
+		if name == "" {
+			name = "Ore type " + ore.TypeID
+		}
+		lines = append(lines, fmt.Sprintf("• %s: **%.1f%%**", escapeMarkdown(name), ore.Volume/totalVolume*100))
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return []discord.Field{{Name: "Ore Composition", Value: strings.Join(lines, "\n"), Inline: false}}
 }
 
 func decloakFields(view *eventView) []discord.Field {
