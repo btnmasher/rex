@@ -79,7 +79,7 @@ func TestAlertSelectorHierarchy(t *testing.T) {
 		},
 		{
 			name:     "structure resources includes fuel and reagents",
-			selector: AlertStructureFuel,
+			selector: AlertStructureFuel + ".*",
 			want:     []string{AlertStructureFuelAlert, AlertStructureLowReagents, AlertStructureNoReagents},
 		},
 		{

@@ -27,7 +27,7 @@ const (
 	defaultConcurrency = 8
 	defaultInterval    = time.Minute
 	defaultLookbehind  = 10 * time.Minute
-	maxLookbehind      = 10 * time.Minute
+	maxLookbehind      = time.Hour
 	seenRetention      = time.Hour
 )
 
