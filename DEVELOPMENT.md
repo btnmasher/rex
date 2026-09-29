@@ -144,7 +144,7 @@ For each character stream, the poller:
 
 1. Selects a usable corporation token and fetches the notification list from ESI.
 2. Ignores `is_read`; cursor state and the global notification-ID ledger are authoritative.
-3. Sorts eligible rows by notification timestamp and applies the hard ten-minute lookbehind.
+3. Sorts eligible rows by notification timestamp and applies the hard one-hour lookbehind.
 4. Marks stale rows and durably admits delivery candidates without advancing past persistence failures.
 5. Classifies known notification types into canonical dot-path alert leaves.
 6. Pre-routes matching targets without external enrichment and enqueues them atomically with the cursor.
@@ -157,7 +157,7 @@ original row; it reclassifies the stored payload before delivery.
 
 The cursor rules are intentionally conservative:
 
-- Existing streams never deliver a notification older than the ten-minute lookbehind.
+- Existing streams never deliver a notification older than the one-hour lookbehind.
 - New streams use the same window rather than replaying the entire first ESI response.
 - Future upstream timestamps are clamped to current UTC before cursor storage.
 - Rows marked stale are considered handled and advance the character cursor.

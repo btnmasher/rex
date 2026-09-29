@@ -49,7 +49,7 @@ Common optional settings:
 | `ESI_BASE_URL` | `https://esi.evetech.net` | ESI endpoint. |
 | `ESI_COMPATIBILITY_DATE` | `2026-05-19` | ESI compatibility date. |
 | `POLL_INTERVAL` | `1m` | Wall-clock-aligned corporation scheduler interval after the initial startup poll. |
-| `POLL_LOOKBEHIND` | `10m` | Maximum age of a notification considered for delivery. Capped at 10 minutes. |
+| `POLL_LOOKBEHIND` | `10m` | Maximum age of a notification considered for delivery. Capped at 1 hour. |
 | `HTTP_TIMEOUT` | `20s` | ESI and auth-next HTTP timeout. |
 | `AUTH_NEXT_TOKEN_EXPORT_COUNT` | `60` | Number of access tokens requested per corporation, from `1` through `64`. |
 | `ALERT_DESTINATIONS_CONFIG` | `alert-destinations.json` | Versioned JSON or YAML destination configuration. |

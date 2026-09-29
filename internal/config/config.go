@@ -17,7 +17,7 @@ const (
 	defaultCompatibilityDate = "2026-05-19"
 	defaultPollInterval      = time.Minute
 	defaultPollLookbehind    = 10 * time.Minute
-	maxPollLookbehind        = 10 * time.Minute
+	maxPollLookbehind        = time.Hour
 	defaultHTTPTimeout       = 20 * time.Second
 	defaultJobStore          = "memory"
 	defaultSQLitePath        = "rex-jobruntime.sqlite"
