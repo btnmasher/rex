@@ -1050,6 +1050,11 @@ func TestAlertColorDefaults(t *testing.T) {
 			expectedColor: colorDanger,
 		},
 		{
+			name:          "moon mining extraction finished",
+			event:         notifications.Event{AlertType: notifications.AlertMoonminingExtractionFinished, NotificationType: "MoonminingExtractionFinished"},
+			expectedColor: colorSuccess,
+		},
+		{
 			name:          "moon mining laser fired",
 			event:         notifications.Event{AlertType: notifications.AlertMoonminingLaserFired, NotificationType: "MoonminingLaserFired"},
 			expectedColor: colorSuccess,

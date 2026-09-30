@@ -143,6 +143,30 @@ func (d *Database) ResolveNames(ctx context.Context, kind string, ids []string) 
 	}
 }
 
+// ResolveSolarSystemsByNames resolves solar-system names with their regions and sovereignty.
+func (d *Database) ResolveSolarSystemsByNames(ctx context.Context, names []string) (map[string]universe.SolarSystem, error) {
+	if len(names) == 0 {
+		return map[string]universe.SolarSystem{}, nil
+	}
+	rows, err := d.queries.ResolveSolarSystemsByNames(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]universe.SolarSystem, len(rows))
+	for i := range rows {
+		row := rows[i]
+		out[row.SolarSystemName] = universe.SolarSystem{
+			ID:           row.SolarSystemID,
+			Name:         row.SolarSystemName,
+			RegionID:     row.RegionID,
+			RegionName:   optionalString(row.RegionName),
+			AllianceID:   optionalString(row.AllianceID),
+			AllianceName: optionalString(row.AllianceName),
+		}
+	}
+	return out, nil
+}
+
 func (d *Database) resolveCharacterNames(ctx context.Context, ids []string) (map[string]string, error) {
 	rows, err := d.queries.ResolveCharacterNames(ctx, ids)
 	if err != nil {

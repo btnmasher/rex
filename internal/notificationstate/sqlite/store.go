@@ -32,6 +32,7 @@ type Store struct {
 
 var _ notificationstate.Store = (*Store)(nil)
 var _ notificationstate.AlertHistory = (*Store)(nil)
+var _ notificationstate.SkippedNotificationStore = (*Store)(nil)
 
 // NewStore opens or creates a durable cursor database and applies Goose migrations using ctx.
 func NewStore(ctx context.Context, path string) (*Store, error) {
@@ -59,6 +60,10 @@ func NewStore(ctx context.Context, path string) (*Store, error) {
 	if err := store.PruneAlertHistory(ctx, time.Now().UTC().Add(-alertHistoryRetention)); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("prune notification alert history: %w", err)
+	}
+	if err := store.PruneSkippedNotifications(ctx, time.Now().UTC().Add(-notificationstate.SkippedNotificationRetention)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("prune skipped notification diagnostics: %w", err)
 	}
 	return store, nil
 }
@@ -125,6 +130,38 @@ func (s *Store) MarkSeen(ctx context.Context, notificationID int64) (bool, error
 		return false, fmt.Errorf("inspect notification %d seen result: %w", notificationID, err)
 	}
 	return rows == 1, nil
+}
+
+// RecordSkippedNotification stores an optional raw diagnostic for an abandoned notification.
+func (s *Store) RecordSkippedNotification(ctx context.Context, record *notificationstate.SkippedNotification) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
+	if record == nil || record.NotificationID <= 0 || strings.TrimSpace(record.Reason) == "" || len(record.RawNotificationJSON) == 0 {
+		return errors.New("skipped notification record is incomplete")
+	}
+	now := time.Now().UTC()
+	skippedAt := record.SkippedAt
+	if skippedAt.IsZero() {
+		skippedAt = now
+	}
+	if err := s.queries.InsertSkippedNotification(ctx, gen.InsertSkippedNotificationParams{
+		NotificationID:        record.NotificationID,
+		NotificationType:      record.NotificationType,
+		SenderID:              record.SenderID,
+		SenderType:            record.SenderType,
+		NotificationTimestamp: record.Timestamp.Unix(),
+		CorporationID:         record.CorporationID,
+		CorporationName:       record.CorporationName,
+		CorporationTicker:     record.CorporationTicker,
+		CharacterID:           record.CharacterID,
+		Reason:                record.Reason,
+		SkippedAt:             skippedAt.Unix(),
+		RawNotificationJson:   record.RawNotificationJSON,
+	}); err != nil {
+		return fmt.Errorf("record skipped notification %d: %w", record.NotificationID, err)
+	}
+	return nil
 }
 
 // Admit atomically marks a notification seen, persists its cursor, and stores
@@ -431,6 +468,17 @@ func (s *Store) PruneAlertHistory(ctx context.Context, before time.Time) error {
 	}
 	if err := s.queries.DeleteAlertHistoryBefore(ctx, before.Unix()); err != nil {
 		return fmt.Errorf("delete expired alert history: %w", err)
+	}
+	return nil
+}
+
+// PruneSkippedNotifications removes skipped-notification diagnostics older than before.
+func (s *Store) PruneSkippedNotifications(ctx context.Context, before time.Time) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
+	if err := s.queries.DeleteSkippedNotificationsBefore(ctx, before.Unix()); err != nil {
+		return fmt.Errorf("delete skipped notifications before %s: %w", before.UTC().Format(time.RFC3339), err)
 	}
 	return nil
 }

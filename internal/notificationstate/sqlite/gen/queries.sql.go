@@ -28,6 +28,15 @@ func (q *Queries) DeletePending(ctx context.Context, notificationID int64) error
 	return err
 }
 
+const deleteSkippedNotificationsBefore = `-- name: DeleteSkippedNotificationsBefore :exec
+delete from notification_skips where skipped_at < ?
+`
+
+func (q *Queries) DeleteSkippedNotificationsBefore(ctx context.Context, skippedAt int64) error {
+	_, err := q.db.ExecContext(ctx, deleteSkippedNotificationsBefore, skippedAt)
+	return err
+}
+
 const getCursor = `-- name: GetCursor :one
 select state_json
 from notification_cursors
@@ -150,6 +159,57 @@ func (q *Queries) InsertPending(ctx context.Context, arg InsertPendingParams) er
 		arg.CreatedAt,
 		arg.NextRetryAt,
 		arg.LastError,
+	)
+	return err
+}
+
+const insertSkippedNotification = `-- name: InsertSkippedNotification :exec
+insert into notification_skips (
+  notification_id,
+  notification_type,
+  sender_id,
+  sender_type,
+  notification_timestamp,
+  corporation_id,
+  corporation_name,
+  corporation_ticker,
+  character_id,
+  reason,
+  skipped_at,
+  raw_notification_json
+)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+type InsertSkippedNotificationParams struct {
+	NotificationID        int64  `json:"notification_id"`
+	NotificationType      string `json:"notification_type"`
+	SenderID              int64  `json:"sender_id"`
+	SenderType            string `json:"sender_type"`
+	NotificationTimestamp int64  `json:"notification_timestamp"`
+	CorporationID         string `json:"corporation_id"`
+	CorporationName       string `json:"corporation_name"`
+	CorporationTicker     string `json:"corporation_ticker"`
+	CharacterID           string `json:"character_id"`
+	Reason                string `json:"reason"`
+	SkippedAt             int64  `json:"skipped_at"`
+	RawNotificationJson   []byte `json:"raw_notification_json"`
+}
+
+func (q *Queries) InsertSkippedNotification(ctx context.Context, arg InsertSkippedNotificationParams) error {
+	_, err := q.db.ExecContext(ctx, insertSkippedNotification,
+		arg.NotificationID,
+		arg.NotificationType,
+		arg.SenderID,
+		arg.SenderType,
+		arg.NotificationTimestamp,
+		arg.CorporationID,
+		arg.CorporationName,
+		arg.CorporationTicker,
+		arg.CharacterID,
+		arg.Reason,
+		arg.SkippedAt,
+		arg.RawNotificationJson,
 	)
 	return err
 }

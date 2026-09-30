@@ -13,6 +13,17 @@ import (
 type enrichmentDatabase struct {
 	structures []authnextdb.Structure
 	ids        []string
+	systems    map[string]universe.SolarSystem
+}
+
+func (d *enrichmentDatabase) ResolveSolarSystemsByNames(_ context.Context, names []string) (map[string]universe.SolarSystem, error) {
+	resolved := make(map[string]universe.SolarSystem, len(names))
+	for _, name := range names {
+		if system, ok := d.systems[name]; ok {
+			resolved[name] = system
+		}
+	}
+	return resolved, nil
 }
 
 func (d *enrichmentDatabase) GetStructuresByIDs(_ context.Context, ids []string) ([]authnextdb.Structure, error) {
@@ -109,6 +120,29 @@ func TestEnrichResolvesMoonminingOreNames(t *testing.T) {
 	}
 	if view.OreTypeNames["45498"] != "Athanor" {
 		t.Fatalf("ore type names = %#v", view.OreTypeNames)
+	}
+}
+
+func TestEnrichesBulkStructureSourceSystemFromGateName(t *testing.T) {
+	database := &enrichmentDatabase{systems: map[string]universe.SolarSystem{
+		"AGG-NR": {ID: "30002652", Name: "AGG-NR", RegionID: "10000004", RegionName: "Genesis"},
+	}}
+	view, err := NewService(database, nil, nil).Enrich(context.Background(), &Envelope{
+		Corporation: authnextdb.Corporation{ID: "100", Name: "Polling Corp"},
+		Event: notifications.Event{
+			NotificationType: "StructuresReinforcementChanged",
+			AlertType:        notifications.AlertStructuresReinforcementChanged,
+			StructureIDs:     []string{"1055856572540"},
+			StructureReferences: []notifications.StructureReference{{
+				ID: "1055856572540", Name: `"AGG-NR » RO0-AF - Scouts out"`, TypeID: "35841", SystemName: "AGG-NR",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("enrich notification: %v", err)
+	}
+	if len(view.Structures) != 1 || view.Structures[0].SystemID != "30002652" || optionalString(view.Structures[0].SystemName) != "AGG-NR" || optionalString(view.Structures[0].RegionName) != "Genesis" {
+		t.Fatalf("bulk structure location = %#v", view.Structures)
 	}
 }
 

@@ -64,6 +64,19 @@ from universe_eve_alliance_ids where alliance_id = any($1::text[]);
 select solar_system_id as entity_id, solar_system_name as entity_name
 from universe_eve_solar_systems where solar_system_id = any($1::text[]);
 
+-- name: ResolveSolarSystemsByNames :many
+select
+  systems.solar_system_id,
+  systems.solar_system_name,
+  systems.region_id,
+  regions.region_name,
+  sovereignty.alliance_id,
+  sovereignty.alliance_name
+from universe_eve_solar_systems systems
+left join universe_eve_regions regions on regions.region_id = systems.region_id
+left join structure_sovereignty_systems sovereignty on sovereignty.system_id = systems.solar_system_id
+where systems.solar_system_name = any($1::text[]);
+
 -- name: ResolveRegionNames :many
 select region_id as entity_id, region_name as entity_name
 from universe_eve_regions where region_id = any($1::text[]);

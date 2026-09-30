@@ -19,6 +19,7 @@ import (
 	jobmemory "github.com/btnmasher/rex/jobruntime/jobstore/memory"
 	jobpostgres "github.com/btnmasher/rex/jobruntime/jobstore/postgres"
 	jobsqlite "github.com/btnmasher/rex/jobruntime/jobstore/sqlite"
+	"github.com/btnmasher/rex/jobruntime/scheduler"
 
 	"github.com/btnmasher/rex/internal/alerts"
 	"github.com/btnmasher/rex/internal/authnextdb"
@@ -28,6 +29,7 @@ import (
 	"github.com/btnmasher/rex/internal/enrichment"
 	"github.com/btnmasher/rex/internal/esi"
 	"github.com/btnmasher/rex/internal/logging"
+	"github.com/btnmasher/rex/internal/notificationstate"
 	notificationstatesqlite "github.com/btnmasher/rex/internal/notificationstate/sqlite"
 	"github.com/btnmasher/rex/internal/poller"
 	"github.com/btnmasher/rex/internal/token"
@@ -37,16 +39,18 @@ import (
 )
 
 const (
-	notificationConcurrency    = 8
-	tokenRefreshConcurrency    = 8
-	tokenRefreshStartupTimeout = 2 * time.Minute
-	jobWorkerCount             = 3
+	notificationConcurrency          = 8
+	tokenRefreshConcurrency          = 8
+	tokenRefreshStartupTimeout       = 2 * time.Minute
+	skippedNotificationPruneInterval = time.Hour
+	jobWorkerCount                   = 4
 )
 
 type application struct {
 	notificationPoller   *poller.Poller
 	notificationDelivery *delivery.Worker
 	tokenRefreshJob      *tokenrefresh.Job
+	notificationState    notificationstate.SkippedNotificationStore
 	logger               *slog.Logger
 }
 
@@ -245,11 +249,12 @@ func newApplication(
 		Enqueuer:  notificationDelivery,
 		PreRouter: alertService,
 	}, poller.Config{
-		Interval:    cfg.PollInterval,
-		Lookbehind:  cfg.PollLookbehind,
-		Concurrency: notificationConcurrency,
-		Logger:      logger,
-		StateStore:  notificationStateStore,
+		Interval:                   cfg.PollInterval,
+		Lookbehind:                 cfg.PollLookbehind,
+		Concurrency:                notificationConcurrency,
+		Logger:                     logger,
+		StateStore:                 notificationStateStore,
+		RecordSkippedNotifications: cfg.RecordSkippedNotifications,
 	})
 	if err != nil {
 		return nil, err
@@ -258,12 +263,13 @@ func newApplication(
 		notificationPoller:   notificationPoller,
 		notificationDelivery: notificationDelivery,
 		tokenRefreshJob:      refreshJob,
+		notificationState:    notificationStateStore,
 		logger:               logger,
 	}, nil
 }
 
 func (a *application) run(ctx context.Context) error {
-	if a == nil || a.notificationPoller == nil || a.notificationDelivery == nil || a.tokenRefreshJob == nil {
+	if a == nil || a.notificationPoller == nil || a.notificationDelivery == nil || a.tokenRefreshJob == nil || a.notificationState == nil {
 		return errors.New("application workers are required")
 	}
 	if ctx == nil {
@@ -302,6 +308,16 @@ func (a *application) run(ctx context.Context) error {
 		defer workers.Done()
 		workerErrors <- runWorkerSafely(logger, "access-token refresh scheduler", func() error {
 			return a.tokenRefreshJob.RunPeriodically(jobContext)
+		})
+	}()
+	go func() {
+		defer workers.Done()
+		workerErrors <- runWorkerSafely(logger, "skipped notification cleanup scheduler", func() error {
+			return scheduler.Run(jobContext, skippedNotificationPruneInterval, func(ctx context.Context) {
+				if err := a.notificationState.PruneSkippedNotifications(ctx, time.Now().UTC().Add(-notificationstate.SkippedNotificationRetention)); err != nil {
+					logger.Warn("prune skipped notification diagnostics failed", "err", err)
+				}
+			})
 		})
 	}()
 

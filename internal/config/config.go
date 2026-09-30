@@ -47,6 +47,7 @@ type Config struct {
 	LogLevel                       string
 	LogPretty                      bool
 	LogPayloads                    bool
+	RecordSkippedNotifications     bool
 }
 
 // AlertConfig contains the validated configuration needed to deliver alerts.
@@ -81,6 +82,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	recordSkippedNotifications, err := boolValue("RECORD_SKIPPED_NOTIFICATIONS", false)
+	if err != nil {
+		return Config{}, err
+	}
 	clientID, err := required("EVE_SSO_CLIENT_ID")
 	if err != nil {
 		return Config{}, err
@@ -103,6 +108,7 @@ func Load() (Config, error) {
 		AlertDestinations:              alertConfig.AlertDestinations,
 		LogPretty:                      alertConfig.LogPretty,
 		LogPayloads:                    alertConfig.LogPayloads,
+		RecordSkippedNotifications:     recordSkippedNotifications,
 		LogLevel:                       strings.ToUpper(valueOrDefault("LOG_LEVEL", defaultLogLevel)),
 	}
 	config.PollInterval, err = durationValue("POLL_INTERVAL", config.PollInterval)

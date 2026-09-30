@@ -232,7 +232,7 @@ var alertColors = map[string]int{
 	notifications.AlertMercenaryDenNewMTO:            colorWarning,
 	notifications.AlertMoonminingExtractionStarted:   colorInformational,
 	notifications.AlertMoonminingExtractionCancelled: colorDanger,
-	notifications.AlertMoonminingExtractionFinished:  colorDanger,
+	notifications.AlertMoonminingExtractionFinished:  colorSuccess,
 	notifications.AlertMoonminingLaserFired:          colorSuccess,
 	notifications.AlertMoonminingAutomaticFracture:   colorSuccess,
 
