@@ -49,3 +49,19 @@ type NotificationSeen struct {
 	NotificationID int64 `json:"notification_id"`
 	SeenAt         int64 `json:"seen_at"`
 }
+
+type NotificationSkip struct {
+	ID                    int64  `json:"id"`
+	NotificationID        int64  `json:"notification_id"`
+	NotificationType      string `json:"notification_type"`
+	SenderID              int64  `json:"sender_id"`
+	SenderType            string `json:"sender_type"`
+	NotificationTimestamp int64  `json:"notification_timestamp"`
+	CorporationID         string `json:"corporation_id"`
+	CorporationName       string `json:"corporation_name"`
+	CorporationTicker     string `json:"corporation_ticker"`
+	CharacterID           string `json:"character_id"`
+	Reason                string `json:"reason"`
+	SkippedAt             int64  `json:"skipped_at"`
+	RawNotificationJson   []byte `json:"raw_notification_json"`
+}

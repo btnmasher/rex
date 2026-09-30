@@ -388,6 +388,56 @@ func (q *Queries) ResolveSolarSystemNames(ctx context.Context, dollar_1 []string
 	return items, nil
 }
 
+const resolveSolarSystemsByNames = `-- name: ResolveSolarSystemsByNames :many
+select
+  systems.solar_system_id,
+  systems.solar_system_name,
+  systems.region_id,
+  regions.region_name,
+  sovereignty.alliance_id,
+  sovereignty.alliance_name
+from universe_eve_solar_systems systems
+left join universe_eve_regions regions on regions.region_id = systems.region_id
+left join structure_sovereignty_systems sovereignty on sovereignty.system_id = systems.solar_system_id
+where systems.solar_system_name = any($1::text[])
+`
+
+type ResolveSolarSystemsByNamesRow struct {
+	SolarSystemID   string      `json:"solar_system_id"`
+	SolarSystemName string      `json:"solar_system_name"`
+	RegionID        string      `json:"region_id"`
+	RegionName      pgtype.Text `json:"region_name"`
+	AllianceID      pgtype.Text `json:"alliance_id"`
+	AllianceName    pgtype.Text `json:"alliance_name"`
+}
+
+func (q *Queries) ResolveSolarSystemsByNames(ctx context.Context, dollar_1 []string) ([]ResolveSolarSystemsByNamesRow, error) {
+	rows, err := q.db.Query(ctx, resolveSolarSystemsByNames, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ResolveSolarSystemsByNamesRow{}
+	for rows.Next() {
+		var i ResolveSolarSystemsByNamesRow
+		if err := rows.Scan(
+			&i.SolarSystemID,
+			&i.SolarSystemName,
+			&i.RegionID,
+			&i.RegionName,
+			&i.AllianceID,
+			&i.AllianceName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const resolveTypeNames = `-- name: ResolveTypeNames :many
 select type_id as entity_id, type_name as entity_name
 from universe_eve_inv_types where type_id = any($1::text[])

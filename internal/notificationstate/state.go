@@ -13,6 +13,9 @@ import (
 
 const maxPendingNotificationBytes = 256 << 10
 
+// SkippedNotificationRetention is the maximum age of optional skipped-notification diagnostics.
+const SkippedNotificationRetention = 7 * 24 * time.Hour
+
 const (
 	// AlertDeliveryStatusDelivered identifies an alert accepted by Discord.
 	AlertDeliveryStatusDelivered = "delivered"
@@ -98,10 +101,32 @@ type AlertHistoryRecord struct {
 	DiscordPayloadJSON  []byte
 }
 
+// SkippedNotification records an ESI notification intentionally abandoned before delivery.
+type SkippedNotification struct {
+	NotificationID      int64
+	NotificationType    string
+	SenderID            int64
+	SenderType          string
+	Timestamp           time.Time
+	CorporationID       string
+	CorporationName     string
+	CorporationTicker   string
+	CharacterID         string
+	Reason              string
+	SkippedAt           time.Time
+	RawNotificationJSON []byte
+}
+
 // AlertHistory persists and lists terminal alert delivery outcomes.
 type AlertHistory interface {
 	RecordAlert(context.Context, *AlertHistoryRecord) error
 	ListAlertHistory(context.Context, time.Time, int) ([]AlertHistoryRecord, error)
+}
+
+// SkippedNotificationStore persists optional diagnostics for abandoned ESI notifications.
+type SkippedNotificationStore interface {
+	RecordSkippedNotification(context.Context, *SkippedNotification) error
+	PruneSkippedNotifications(context.Context, time.Time) error
 }
 
 // Validate checks the identity, timestamp, and payload fields required by an
@@ -173,11 +198,52 @@ type MemoryStore struct {
 	values  map[string]Cursor
 	seen    map[int64]time.Time
 	pending map[int64]PendingNotification
+	skipped []SkippedNotification
 }
 
 // NewMemoryStore creates an empty process-local cursor store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{values: make(map[string]Cursor), seen: make(map[int64]time.Time), pending: make(map[int64]PendingNotification)}
+}
+
+// RecordSkippedNotification stores an optional diagnostic notification in memory.
+func (s *MemoryStore) RecordSkippedNotification(ctx context.Context, record *SkippedNotification) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
+	if record == nil {
+		return errors.New("skipped notification record is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().UTC().Add(-SkippedNotificationRetention)
+	keptCount := 0
+	for index := range s.skipped {
+		if s.skipped[index].SkippedAt.After(cutoff) {
+			s.skipped[keptCount] = s.skipped[index]
+			keptCount++
+		}
+	}
+	s.skipped = append(s.skipped[:keptCount], cloneSkippedNotification(record))
+	return nil
+}
+
+// PruneSkippedNotifications removes in-memory diagnostics older than before.
+func (s *MemoryStore) PruneSkippedNotifications(ctx context.Context, before time.Time) error {
+	if err := s.validateContext(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keptCount := 0
+	for index := range s.skipped {
+		if !s.skipped[index].SkippedAt.Before(before) {
+			s.skipped[keptCount] = s.skipped[index]
+			keptCount++
+		}
+	}
+	s.skipped = s.skipped[:keptCount]
+	return nil
 }
 
 // Load returns a cloned cursor or an empty cursor when none exists.
@@ -337,6 +403,15 @@ func clonePending(value *PendingNotification) PendingNotification {
 	clone.DestinationIDs = append([]string(nil), value.DestinationIDs...)
 	clone.DeliveredDestinationIDs = append([]string(nil), value.DeliveredDestinationIDs...)
 	clone.FailedDestinationIDs = append([]string(nil), value.FailedDestinationIDs...)
+	return clone
+}
+
+func cloneSkippedNotification(value *SkippedNotification) SkippedNotification {
+	if value == nil {
+		return SkippedNotification{}
+	}
+	clone := *value
+	clone.RawNotificationJSON = append([]byte(nil), value.RawNotificationJSON...)
 	return clone
 }
 

@@ -23,6 +23,11 @@ type NameDatabase interface {
 	ResolveNames(context.Context, string, []string) (map[string]string, error)
 }
 
+// SolarSystemNameDatabase resolves solar-system names with their geography.
+type SolarSystemNameDatabase interface {
+	ResolveSolarSystemsByNames(context.Context, []string) (map[string]universe.SolarSystem, error)
+}
+
 // Enricher builds provider-neutral notification contexts for destination adapters.
 type Enricher interface {
 	Enrich(context.Context, *Envelope) (*Context, error)
@@ -93,6 +98,8 @@ func (s *Service) Enrich(ctx context.Context, envelope *Envelope) (*Context, err
 	}
 	event := envelope.Event
 	structures := s.loadStructures(ctx, event.StructureIDs, event.NotificationID)
+	structures = addMissingStructureReferences(structures, event.StructureReferences)
+	s.enrichBulkStructureLocations(ctx, structures, event.StructureReferences)
 	s.enrichStructures(ctx, structures)
 	event.StructureTypeID = structureTypeIDForEvent(&event, structures)
 	structureTypeName := s.resolveStructureTypeName(ctx, event.StructureTypeID, structures)
@@ -150,6 +157,81 @@ func (s *Service) Enrich(ctx context.Context, envelope *Envelope) (*Context, err
 		"structure_count", len(structures),
 	)
 	return view, nil
+}
+
+func addMissingStructureReferences(structures []authnextdb.Structure, references []notifications.StructureReference) []authnextdb.Structure {
+	known := make(map[string]struct{}, len(structures))
+	for index := range structures {
+		known[structures[index].ID] = struct{}{}
+	}
+	for _, reference := range references {
+		if reference.ID == "" {
+			continue
+		}
+		if _, ok := known[reference.ID]; ok {
+			continue
+		}
+		name := reference.Name
+		structures = append(structures, authnextdb.Structure{ID: reference.ID, Name: &name, TypeID: reference.TypeID})
+		known[reference.ID] = struct{}{}
+	}
+	return structures
+}
+
+func (s *Service) enrichBulkStructureLocations(ctx context.Context, structures []authnextdb.Structure, references []notifications.StructureReference) {
+	database, ok := s.database.(SolarSystemNameDatabase)
+	if !ok || len(structures) == 0 {
+		return
+	}
+	names := bulkStructureSystemNames(references)
+	if len(names) == 0 {
+		return
+	}
+	systems, err := database.ResolveSolarSystemsByNames(ctx, names)
+	if err != nil {
+		s.logger.Warn("alert bulk structure location enrichment failed", "err", err)
+		return
+	}
+	for index := range structures {
+		structure := &structures[index]
+		if strings.TrimSpace(structure.SystemID) != "" || strings.TrimSpace(optionalString(structure.SystemName)) != "" {
+			continue
+		}
+		applyBulkStructureLocation(structure, references, systems)
+	}
+}
+
+func bulkStructureSystemNames(references []notifications.StructureReference) []string {
+	names := make([]string, 0, len(references))
+	for _, reference := range references {
+		if name := strings.TrimSpace(reference.SystemName); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func applyBulkStructureLocation(structure *authnextdb.Structure, references []notifications.StructureReference, systems map[string]universe.SolarSystem) {
+	if structure == nil {
+		return
+	}
+	for _, reference := range references {
+		if reference.ID != structure.ID || reference.SystemName == "" {
+			continue
+		}
+		system, ok := systems[reference.SystemName]
+		if !ok {
+			return
+		}
+		name := system.Name
+		structure.SystemID = system.ID
+		structure.SystemName = &name
+		regionID := system.RegionID
+		regionName := system.RegionName
+		structure.RegionID = &regionID
+		structure.RegionName = &regionName
+		return
+	}
 }
 
 func (s *Service) loadStructures(ctx context.Context, structureIDs []string, notificationID int64) []authnextdb.Structure {

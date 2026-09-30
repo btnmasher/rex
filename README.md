@@ -56,6 +56,7 @@ Common optional settings:
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, or `ERROR`. |
 | `LOG_PRETTY` | `false` | Use terminal-friendly logs when stderr is a TTY. |
 | `LOG_PAYLOADS` | `false` | Include bounded raw payloads in debug logs after routing matches. |
+| `RECORD_SKIPPED_NOTIFICATIONS` | `false` | Persist metadata, skip reason, and raw payload for abandoned notifications for up to 7 days. |
 | `JOB_STORE` | `memory` | Generic job store: `memory`, `sqlite`, or `postgres`. |
 | `JOB_STORE_SQLITE_PATH` | `rex-jobruntime.sqlite` | SQLite job-store path. |
 | `NOTIFICATION_STATE_SQLITE_PATH` | `rex-notification-state.sqlite` | Durable cursor, retry, deduplication, and history database. |

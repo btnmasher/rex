@@ -184,6 +184,67 @@ func TestStorePrunesAlertHistoryAfterInsertion(t *testing.T) {
 	}
 }
 
+func TestStoreRecordsAndPrunesSkippedNotifications(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notification-state.sqlite")
+	store, err := NewStore(context.Background(), path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-notificationstate.SkippedNotificationRetention - time.Second)
+	if _, err := store.db.ExecContext(ctx, `
+		insert into notification_skips (
+		  notification_id, notification_type, sender_id, sender_type,
+		  notification_timestamp, corporation_id, corporation_name, corporation_ticker,
+		  character_id, reason, skipped_at, raw_notification_json
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		800, "StructureUnderAttack", 100, "corporation", old.Unix(), "100", "Corp", "CORP",
+		"900000001", "old", old.Unix(), []byte(`{"notification_id":800}`)); err != nil {
+		_ = store.Close()
+		t.Fatalf("insert old skipped notification: %v", err)
+	}
+	if err := store.RecordSkippedNotification(ctx, &notificationstate.SkippedNotification{
+		NotificationID:      801,
+		NotificationType:    "StructureFuelAlert",
+		SenderID:            100,
+		SenderType:          "corporation",
+		Timestamp:           time.Now().UTC(),
+		CorporationID:       "100",
+		CorporationName:     "Corp",
+		CorporationTicker:   "CORP",
+		CharacterID:         "900000001",
+		Reason:              "no_configured_destinations",
+		RawNotificationJSON: []byte(`{"notification_id":801,"text":"raw"}`),
+	}); err != nil {
+		_ = store.Close()
+		t.Fatalf("record skipped notification: %v", err)
+	}
+	if err := store.PruneSkippedNotifications(ctx, time.Now().UTC().Add(-notificationstate.SkippedNotificationRetention)); err != nil {
+		t.Fatalf("prune skipped notifications: %v", err)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, "select count(*) from notification_skips").Scan(&count); err != nil {
+		t.Fatalf("count skipped notifications: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retained skipped notifications = %d, want 1", count)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	store, err = NewStore(context.Background(), path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.db.QueryRowContext(ctx, "select count(*) from notification_skips").Scan(&count); err != nil {
+		t.Fatalf("count skipped notifications after reopen: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retained skipped notifications after reopen = %d, want 1", count)
+	}
+}
+
 func TestStoreRecordsAppliedSchemaVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "notification-state.sqlite")
 	store, err := NewStore(context.Background(), path)

@@ -91,6 +91,7 @@ const (
 	maxStructureIDs                        = 16
 	maxBulkStructureIDs                    = 64
 	maxResourceRequirements                = 16
+	structureNameParts                     = 2
 	eveTickDuration                        = 100 * time.Nanosecond
 	eveEpochOffsetSeconds                  = 11644473600
 	eveTicksPerSecond                      = int64(time.Second / eveTickDuration)
@@ -101,6 +102,7 @@ var (
 	structureIDPattern            = regexp.MustCompile(`(?i)(?:structure[_ -]?id|structureid)\D{0,24}(\d{5,})`)
 	bulkStructureIDPattern        = regexp.MustCompile(`(?:^|\s)-\s*-\s*(\d{5,})(?:\s|$)`)
 	bulkStructureInfoEntryPattern = regexp.MustCompile(`^\s*(?:-\s*-\s*)?(\d{5,})\s*-\s*(.*?)\s*-\s*(\d+)\s*$`)
+	legacyHexEscapePattern        = regexp.MustCompile(`\\x([0-9A-Fa-f]{2})`)
 	systemIDPattern               = regexp.MustCompile(`(?i)(?:solar[_ -]?system[_ -]?id|system[_ -]?id|solarsystemid)\D{0,24}(\d{5,})`)
 	numberPattern                 = regexp.MustCompile(`\d+`)
 	selectorSegmentPattern        = regexp.MustCompile(`^[a-z0-9_]+$`)
@@ -182,9 +184,10 @@ type OreComposition struct {
 
 // StructureReference identifies a structure reported by a bulk notification.
 type StructureReference struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	TypeID string `json:"type_id"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	TypeID     string `json:"type_id"`
+	SystemName string `json:"system_name,omitempty"`
 }
 
 // Event is a classified notification ready for enrichment and delivery.
@@ -722,18 +725,37 @@ func parseBulkStructureReferences(value string) []StructureReference {
 		if _, ok := seen[id]; ok {
 			continue
 		}
-		name := strings.TrimSpace(match[2])
+		name := decodeLegacyHexEscapes(strings.TrimSpace(match[2]))
 		typeID := strings.TrimSpace(match[3])
 		if id == "" || typeID == "" {
 			continue
 		}
 		seen[id] = struct{}{}
-		references = append(references, StructureReference{ID: id, Name: name, TypeID: typeID})
+		references = append(references, StructureReference{ID: id, Name: name, TypeID: typeID, SystemName: structureReferenceSystemName(name)})
 		if len(references) == maxBulkStructureIDs {
 			break
 		}
 	}
 	return references
+}
+
+func decodeLegacyHexEscapes(value string) string {
+	return legacyHexEscapePattern.ReplaceAllStringFunc(value, func(match string) string {
+		parsed, err := strconv.ParseUint(match[2:], 16, 8)
+		if err != nil {
+			return match
+		}
+		return string(rune(parsed))
+	})
+}
+
+func structureReferenceSystemName(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), `"`)
+	parts := strings.SplitN(value, " » ", structureNameParts)
+	if len(parts) != structureNameParts {
+		return ""
+	}
+	return strings.TrimSpace(parts[0])
 }
 
 func structureReferenceIDs(references []StructureReference) []string {

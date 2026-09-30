@@ -93,3 +93,23 @@ limit ?;
 
 -- name: DeleteAlertHistoryBefore :exec
 delete from alert_history where dispatched_at < ?;
+
+-- name: InsertSkippedNotification :exec
+insert into notification_skips (
+  notification_id,
+  notification_type,
+  sender_id,
+  sender_type,
+  notification_timestamp,
+  corporation_id,
+  corporation_name,
+  corporation_ticker,
+  character_id,
+  reason,
+  skipped_at,
+  raw_notification_json
+)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- name: DeleteSkippedNotificationsBefore :exec
+delete from notification_skips where skipped_at < ?;

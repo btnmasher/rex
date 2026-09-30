@@ -37,3 +37,20 @@ func TestMemoryStoreRejectsInvalidPendingReschedule(t *testing.T) {
 		t.Fatal("expected invalid pending notification to be rejected")
 	}
 }
+
+func TestMemoryStorePrunesSkippedNotificationsAndClonesPayload(t *testing.T) {
+	store := NewMemoryStore()
+	old := SkippedNotification{NotificationID: 1, Reason: "old", SkippedAt: time.Now().UTC().Add(-SkippedNotificationRetention - time.Second), RawNotificationJSON: []byte(`{"old":true}`)}
+	store.skipped = append(store.skipped, old)
+	record := &SkippedNotification{NotificationID: 2, Reason: "malformed", SkippedAt: time.Now().UTC(), RawNotificationJSON: []byte(`{"text":"raw"}`)}
+	if err := store.RecordSkippedNotification(context.Background(), record); err != nil {
+		t.Fatalf("record skipped notification: %v", err)
+	}
+	record.RawNotificationJSON[0] = 'X'
+	if len(store.skipped) != 1 || store.skipped[0].NotificationID != 2 {
+		t.Fatalf("unexpected skipped notifications: %#v", store.skipped)
+	}
+	if string(store.skipped[0].RawNotificationJSON) != `{"text":"raw"}` {
+		t.Fatalf("payload was not cloned: %s", store.skipped[0].RawNotificationJSON)
+	}
+}

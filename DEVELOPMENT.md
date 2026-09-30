@@ -163,6 +163,13 @@ The cursor rules are intentionally conservative:
 - Rows marked stale are considered handled and advance the character cursor.
 - Cursor or queue-admission failure stops processing before later rows can be skipped; delivery failures remain owned by the queue worker.
 
+When `RECORD_SKIPPED_NOTIFICATIONS=true`, stale, malformed, unclassified, and
+no-destination notifications retain their metadata, raw ESI payload, and skip
+reason for seven days. Skipped diagnostics do not run enrichment or alert
+formatting and do not block cursor advancement if their diagnostic write fails.
+The application prunes expired skipped diagnostics hourly and also performs a
+startup cleanup.
+
 ## Alert Taxonomy And Routing
 
 Canonical alert definitions live in
@@ -218,6 +225,11 @@ to the corporation that polled the notification. Structure records may be
 enriched with system, region, planet, moon, and type data. The ESI payload's
 owner corporation is authoritative; polling-corporation context is only a
 fallback when owner data is absent.
+
+Bulk Ansiblex reinforcement names may encode the source and destination
+systems as `FROM » TO - label`. Rex decodes legacy `\xBB` escapes, uses the
+source system as the structure location when tracked geography is absent, and
+hydrates its region from the local universe projection.
 
 Moon-mining extraction-finished, manual laser-fired, and automatic-fracture
 notifications may include `oreVolumeByType`. Classification preserves the

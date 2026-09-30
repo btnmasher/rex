@@ -599,6 +599,30 @@ func assertReinforcementSchedule(t *testing.T, event *Event) {
 	}
 }
 
+func TestClassifyBulkStructureDecodesGateNameAndSourceSystem(t *testing.T) {
+	event, ok := Classify(&esi.Notification{
+		ID:   2461991014,
+		Type: "StructuresReinforcementChanged",
+		Text: "allStructureInfo:\n" +
+			"- - 1055856572540\n" +
+			"  - \"AGG-NR \\xBB RO0-AF - Scouts out\"\n" +
+			"  - 35841\n" +
+			"hour: 20\nnumStructures: 1\nweekday: 255\n",
+	})
+	if !ok {
+		t.Fatal("expected reinforcement schedule notification to classify")
+	}
+	want := StructureReference{
+		ID:         "1055856572540",
+		Name:       `"AGG-NR » RO0-AF - Scouts out"`,
+		TypeID:     "35841",
+		SystemName: "AGG-NR",
+	}
+	if len(event.StructureReferences) != 1 || event.StructureReferences[0] != want {
+		t.Fatalf("structure references = %#v, want %#v", event.StructureReferences, want)
+	}
+}
+
 func TestClassifyDoesNotAddExcludedNotificationTypes(t *testing.T) {
 	for _, typeName := range []string{
 		"CorpStructLostMsg",

@@ -31,6 +31,15 @@ const (
 	seenRetention      = time.Hour
 )
 
+const (
+	skipReasonLookbehind               = "lookbehind"
+	skipReasonCursor                   = "cursor"
+	skipReasonFutureTimestamp          = "future_timestamp"
+	skipReasonUnclassified             = "unclassified"
+	skipReasonMalformed                = "malformed"
+	skipReasonNoConfiguredDestinations = "no_configured_destinations"
+)
+
 // TokenSource supplies corporation-scoped, refreshable EVE credentials.
 type TokenSource interface {
 	HasConfiguredTokens(string) bool
@@ -62,11 +71,12 @@ type Database interface {
 
 // Config controls polling cadence, concurrency, persistence, and filtering.
 type Config struct {
-	Interval    time.Duration
-	Lookbehind  time.Duration
-	Concurrency int
-	Logger      *slog.Logger
-	StateStore  notificationstate.Store
+	Interval                   time.Duration
+	Lookbehind                 time.Duration
+	Concurrency                int
+	Logger                     *slog.Logger
+	StateStore                 notificationstate.Store
+	RecordSkippedNotifications bool
 }
 
 func (c Config) withDefaults() Config {
@@ -108,18 +118,19 @@ type corporationState struct {
 
 // Poller owns scheduler state and serializes polling per corporation.
 type Poller struct {
-	database    Database
-	tokens      TokenSource
-	esi         ESIClient
-	admission   AlertAdmission
-	interval    time.Duration
-	lookbehind  time.Duration
-	concurrency int
-	logger      *slog.Logger
-	stateStore  notificationstate.Store
-	mu          sync.Mutex
-	states      map[string]*corporationState
-	polling     bool
+	database                   Database
+	tokens                     TokenSource
+	esi                        ESIClient
+	admission                  AlertAdmission
+	interval                   time.Duration
+	lookbehind                 time.Duration
+	concurrency                int
+	logger                     *slog.Logger
+	stateStore                 notificationstate.Store
+	recordSkippedNotifications bool
+	mu                         sync.Mutex
+	states                     map[string]*corporationState
+	polling                    bool
 }
 
 // New creates a notification poller with default configuration.
@@ -134,16 +145,17 @@ func NewWithConfig(database Database, tokens TokenSource, esiClient ESIClient, a
 	}
 	config = config.withDefaults()
 	return &Poller{
-		database:    database,
-		tokens:      tokens,
-		esi:         esiClient,
-		admission:   admission,
-		interval:    config.Interval,
-		lookbehind:  config.Lookbehind,
-		concurrency: config.Concurrency,
-		logger:      config.Logger,
-		stateStore:  config.StateStore,
-		states:      make(map[string]*corporationState),
+		database:                   database,
+		tokens:                     tokens,
+		esi:                        esiClient,
+		admission:                  admission,
+		interval:                   config.Interval,
+		lookbehind:                 config.Lookbehind,
+		concurrency:                config.Concurrency,
+		logger:                     config.Logger,
+		stateStore:                 config.StateStore,
+		recordSkippedNotifications: config.RecordSkippedNotifications,
+		states:                     make(map[string]*corporationState),
 	}, nil
 }
 
@@ -396,7 +408,7 @@ func (p *Poller) processNotifications(
 		return err
 	}
 	cutoff := now.Add(-p.lookbehind)
-	staleCount, err := p.markStaleNotifications(ctx, corporation.ID, characterID, items, state, cutoff, futureIDs)
+	staleCount, err := p.markStaleNotifications(ctx, corporation.ID, corporation.Name, characterID, items, state, cutoff, futureIDs)
 	if err != nil {
 		return err
 	}
@@ -413,7 +425,7 @@ func (p *Poller) processNotifications(
 
 func (p *Poller) markStaleNotifications(
 	ctx context.Context,
-	corporationID, characterID string,
+	corporationID, corporationName, characterID string,
 	items []esi.Notification,
 	state cursorSnapshot,
 	cutoff time.Time,
@@ -434,8 +446,12 @@ func (p *Poller) markStaleNotifications(
 			continue
 		}
 		if item.ID > 0 {
-			if _, err := p.stateStore.MarkSeen(ctx, item.ID); err != nil {
+			claimed, err := p.stateStore.MarkSeen(ctx, item.ID)
+			if err != nil {
 				return 0, fmt.Errorf("mark stale notification %d seen: %w", item.ID, err)
+			}
+			if claimed {
+				p.recordSkippedNotification(ctx, corporationID, corporationName, characterID, item, staleNotificationReason(item, state, cutoff, futureIDs))
 			}
 		}
 		stale = append(stale, *item)
@@ -477,7 +493,7 @@ func (p *Poller) processEligibleNotification(
 	item *esi.Notification,
 ) error {
 	if err := item.Validate(); err != nil {
-		return p.dropMalformedNotification(ctx, corporation.ID, characterID, item, err)
+		return p.dropMalformedNotification(ctx, corporation.ID, corporation.Name, characterID, item, err)
 	}
 	event, ok := notifications.Classify(item)
 	if !ok {
@@ -486,9 +502,12 @@ func (p *Poller) processEligibleNotification(
 			"notification_type", item.Type,
 			"reason", "unclassified",
 		)
-		_, err := p.stateStore.MarkSeen(ctx, item.ID)
+		claimed, err := p.stateStore.MarkSeen(ctx, item.ID)
 		if err != nil {
 			return fmt.Errorf("mark notification %d seen: %w", item.ID, err)
+		}
+		if claimed {
+			p.recordSkippedNotification(ctx, corporation.ID, corporation.Name, characterID, item, skipReasonUnclassified)
 		}
 		return p.advanceStream(ctx, corporation.ID, characterID, item)
 	}
@@ -525,6 +544,9 @@ func (p *Poller) processEligibleNotification(
 			"notification_type", item.Type,
 			"reason", "no_configured_destinations",
 		)
+		if claimed {
+			p.recordSkippedNotification(ctx, corporation.ID, corporation.Name, characterID, item, skipReasonNoConfiguredDestinations)
+		}
 		return nil
 	}
 	if !claimed {
@@ -614,7 +636,7 @@ func applyCursorItems(cursor *notificationstate.Cursor, characterID string, item
 
 func (p *Poller) dropMalformedNotification(
 	ctx context.Context,
-	corporationID, characterID string,
+	corporationID, corporationName, characterID string,
 	item *esi.Notification,
 	validationErr error,
 ) error {
@@ -626,11 +648,60 @@ func (p *Poller) dropMalformedNotification(
 		"reason", validationErr,
 	)
 	if item.ID > 0 {
-		if _, err := p.stateStore.MarkSeen(ctx, item.ID); err != nil {
+		claimed, err := p.stateStore.MarkSeen(ctx, item.ID)
+		if err != nil {
 			return fmt.Errorf("mark malformed notification %d seen: %w", item.ID, err)
+		}
+		if claimed {
+			p.recordSkippedNotification(ctx, corporationID, corporationName, characterID, item, skipReasonMalformed)
 		}
 	}
 	return p.advanceStream(ctx, corporationID, characterID, item)
+}
+
+func (p *Poller) recordSkippedNotification(ctx context.Context, corporationID, corporationName, characterID string, item *esi.Notification, reason string) {
+	if p == nil || !p.recordSkippedNotifications || item == nil || item.ID <= 0 {
+		return
+	}
+	store, ok := p.stateStore.(notificationstate.SkippedNotificationStore)
+	if !ok {
+		p.logger.Warn("skipped notification diagnostics unavailable", "notification_id", item.ID, "reason", reason)
+		return
+	}
+	payload, err := json.Marshal(item)
+	if err != nil {
+		p.logger.Warn("skipped notification diagnostics encode failed", "notification_id", item.ID, "reason", reason, "err", err)
+		return
+	}
+	now := time.Now().UTC()
+	if err := store.RecordSkippedNotification(ctx, &notificationstate.SkippedNotification{
+		NotificationID:      item.ID,
+		NotificationType:    item.Type,
+		SenderID:            item.SenderID,
+		SenderType:          item.SenderType,
+		Timestamp:           item.Timestamp,
+		CorporationID:       corporationID,
+		CorporationName:     corporationName,
+		CharacterID:         characterID,
+		Reason:              reason,
+		SkippedAt:           now,
+		RawNotificationJSON: payload,
+	}); err != nil {
+		p.logger.Warn("record skipped notification failed", "notification_id", item.ID, "reason", reason, "err", err)
+	}
+}
+
+func staleNotificationReason(item *esi.Notification, state cursorSnapshot, cutoff time.Time, futureIDs map[int64]struct{}) string {
+	if _, ok := futureIDs[item.ID]; ok {
+		return skipReasonFutureTimestamp
+	}
+	if item.Timestamp.Before(cutoff) {
+		return skipReasonLookbehind
+	}
+	if item.Timestamp.Before(state.lastTimestamp) || item.Timestamp.Equal(state.lastTimestamp) && hasSeen(state.seenAtCursor, item.ID) {
+		return skipReasonCursor
+	}
+	return skipReasonCursor
 }
 
 func eligibleNotifications(items []esi.Notification, state cursorSnapshot, cutoff time.Time, futureIDs map[int64]struct{}) []esi.Notification {
