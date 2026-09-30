@@ -100,6 +100,7 @@ const (
 
 var (
 	structureIDPattern            = regexp.MustCompile(`(?i)(?:structure[_ -]?id|structureid)\D{0,24}(\d{5,})`)
+	typeIDPattern                 = regexp.MustCompile(`(?i)\btypeID\s*:\s*(\d+)`)
 	bulkStructureIDPattern        = regexp.MustCompile(`(?:^|\s)-\s*-\s*(\d{5,})(?:\s|$)`)
 	bulkStructureInfoEntryPattern = regexp.MustCompile(`^\s*(?:-\s*-\s*)?(\d{5,})\s*-\s*(.*?)\s*-\s*(\d+)\s*$`)
 	legacyHexEscapePattern        = regexp.MustCompile(`\\x([0-9A-Fa-f]{2})`)
@@ -472,13 +473,7 @@ func Classify(notification *esi.Notification) (Event, bool) {
 		}
 	}
 	systemID := firstMatch(systemIDPattern, text)
-	structureTypeID := firstNumber(metadata["structuretypeid"])
-	if structureTypeID == "" {
-		structureTypeID = firstNumber(metadata["structureshowinfodata"])
-	}
-	if structureTypeID == "" {
-		structureTypeID = firstNumber(metadata["typeid"])
-	}
+	structureTypeID := parseStructureTypeID(notification.Type, metadata, text)
 	if structureTypeID == "" && len(structureReferences) == 1 {
 		structureTypeID = structureReferences[0].TypeID
 	}
@@ -657,6 +652,19 @@ func parseResourceRequirements(notificationType, text string) []ResourceRequirem
 		requirements = append(requirements, ResourceRequirement{Quantity: quantity, TypeID: match[2]})
 	}
 	return requirements
+}
+
+func parseStructureTypeID(notificationType string, metadata map[string]string, text string) string {
+	if structureTypeID := firstNumber(metadata["structuretypeid"]); structureTypeID != "" {
+		return structureTypeID
+	}
+	if structureTypeID := firstNumber(metadata["structureshowinfodata"]); structureTypeID != "" {
+		return structureTypeID
+	}
+	if notificationType == "TowerResourceAlertMsg" {
+		return firstMatch(typeIDPattern, text)
+	}
+	return firstNumber(metadata["typeid"])
 }
 
 func parseOreComposition(notificationType, value string) []OreComposition {

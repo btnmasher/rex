@@ -323,6 +323,9 @@ func TestClassifyTowerResourceAlert(t *testing.T) {
 	if event.AlertType != AlertStarbaseResourceAlert || event.OwnerCorporationID != "98790350" || event.AllianceID != "99000001" {
 		t.Fatalf("unexpected tower resource ownership: %#v", event)
 	}
+	if event.StructureTypeID != "35834" {
+		t.Fatalf("unexpected tower structure type: %s", event.StructureTypeID)
+	}
 	if len(event.ResourceRequirements) != 2 || event.ResourceRequirements[0] != (ResourceRequirement{Quantity: 100, TypeID: "4247"}) || event.ResourceRequirements[1] != (ResourceRequirement{Quantity: 20, TypeID: "4246"}) {
 		t.Fatalf("unexpected tower resource requirements: %#v", event.ResourceRequirements)
 	}

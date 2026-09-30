@@ -327,6 +327,18 @@ func (s *Service) resolveEventStructureTypeNames(ctx context.Context, event *not
 			names[typeID] = name
 		}
 	}
+	for _, requirement := range event.ResourceRequirements {
+		typeID := strings.TrimSpace(requirement.TypeID)
+		if typeID == "" {
+			continue
+		}
+		if _, ok := names[typeID]; ok {
+			continue
+		}
+		if name := s.resolveStructureTypeName(ctx, typeID, nil); name != "" {
+			names[typeID] = name
+		}
+	}
 	return names
 }
 

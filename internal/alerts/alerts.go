@@ -1307,7 +1307,11 @@ func resourceFields(view *eventView) []discord.Field {
 		if requirement.TypeID == "" || requirement.Quantity <= 0 {
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("%s x Type %s", formatInteger(requirement.Quantity), escapeMarkdown(requirement.TypeID)))
+		name := strings.TrimSpace(view.StructureTypeNames[requirement.TypeID])
+		if name == "" {
+			name = "Type " + requirement.TypeID
+		}
+		lines = append(lines, fmt.Sprintf("%s x %s", formatInteger(requirement.Quantity), escapeMarkdown(name)))
 	}
 	if len(lines) == 0 {
 		return nil
