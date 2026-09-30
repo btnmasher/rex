@@ -1208,8 +1208,9 @@ func TestRenderStarbaseAlerts(t *testing.T) {
 				{Quantity: 100, TypeID: "4247"},
 			},
 		},
+		StructureTypeNames: map[string]string{"4247": "Nitrogen Fuel Block"},
 	}, "Rex Alerts", "")
-	if !hasField(resourceMessage.Embeds[0].Fields, "Resources Needed", "100 x Type 4247") {
+	if !hasField(resourceMessage.Embeds[0].Fields, "Resources Needed", "100 x Nitrogen Fuel Block") {
 		t.Fatalf("expected starbase resource field: %#v", resourceMessage.Embeds[0].Fields)
 	}
 }
